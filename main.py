@@ -17,24 +17,29 @@ def home():
 @app.get("/callback")
 def callback(code: str):
 
-    r = requests.post(
-        "https://api.etsy.com/v3/public/oauth/token",
-        data={
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "code": code
-        }
-    )
+    url = "https://api.etsy.com/v3/public/oauth/token"
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "code": code
+    }
+
+    r = requests.post(url, data=payload, headers=headers)
 
     data = r.json()
 
-    TOKEN["access_token"] = data.get("access_token")
-    TOKEN["refresh_token"] = data.get("refresh_token")
+    print("STATUS:", r.status_code)
+    print("RESPONSE:", data)
 
     return {
-        "message": "OAuth OK",
-        "access_token": TOKEN["access_token"],
-        "refresh_token": TOKEN["refresh_token"]
+        "raw": data,
+        "access_token": data.get("access_token"),
+        "refresh_token": data.get("refresh_token")
     }
