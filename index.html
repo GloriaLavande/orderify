@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Orderify</title>
+</head>
+<body>
+    <h1>Orderify OAuth</h1>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const code = params.get("code");
+
+        if (code) {
+            document.body.innerHTML =
+                "<h2>Code OAuth :</h2><textarea cols='80' rows='6'>" +
+                code +
+                "</textarea>";
+        }
+    </script>
+</body>
+</html>
