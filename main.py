@@ -7,6 +7,7 @@ Routes :
 - GET /callback           -> reçoit le code Etsy, l'échange contre access_token/refresh_token
 - GET /test-orders        -> JSON brut Etsy, pour debug
 - GET /orders-full        -> JSON PLAT (une ligne par article), prêt pour Google Sheets
+- GET /to-ship            -> Commandes payées non expédiées, infos complètes pour préparer l'envoi
 
 Variables d'environnement à définir sur Render (Environment) :
 - ETSY_API_KEY      = ton Keystring
@@ -416,6 +417,134 @@ def orders_full(limit: int = 10, include_thumbnails: bool = True):
     return {
         "shop_id": shop_id,
         "count_receipts": len(receipts_data.get("results", [])),
+        "count_rows": len(rows),
+        "rows": rows,
+    }
+
+
+@app.get("/to-ship")
+def to_ship(limit: int = 50, include_thumbnails: bool = True):
+    """
+    Liste TOUTES les commandes payées mais pas encore expédiées (was_shipped=false),
+    avec le maximum d'infos utiles pour préparer l'envoi : adresse complète formatée,
+    personnalisation/variations par article, message du vendeur, nombre de jours
+    de traitement restants, etc.
+
+    Une ligne par ARTICLE (une commande avec plusieurs articles = plusieurs lignes,
+    mais regroupées via receipt_id pour pouvoir les recombiner si besoin).
+
+    Paramètres :
+    - limit : nombre max de commandes à récupérer (Etsy retourne par défaut les plus
+      anciennes non expédiées en premier si on trie par date de création croissante,
+      utile pour traiter les plus urgentes d'abord)
+    - include_thumbnails : mettre à False pour aller plus vite si tu n'as pas besoin
+      des images
+    """
+    shop_id = get_shop_id_for_user()
+
+    receipts_resp = requests.get(
+        f"{API_BASE}/shops/{shop_id}/receipts",
+        headers=get_headers(),
+        params={
+            "limit": limit,
+            "was_shipped": "false",
+            "was_paid": "true",
+            "sort_on": "created",
+            "sort_order": "asc",  # les plus anciennes (donc les plus urgentes) en premier
+        },
+    )
+    receipts_data = receipts_resp.json()
+
+    if receipts_resp.status_code != 200:
+        return {"step": "get_receipts", "status_code": receipts_resp.status_code, "data": receipts_data}
+
+    now = time.time()
+    rows = []
+
+    for receipt in receipts_data.get("results", []):
+        receipt_id = receipt.get("receipt_id")
+
+        # Adresse complète, déjà formatée par Etsy (prête à imprimer sur une étiquette)
+        formatted_address = receipt.get("formatted_address")
+
+        created_ts = receipt.get("created_timestamp")
+        days_since_order = round((now - created_ts) / 86400, 1) if created_ts else None
+
+        for t in receipt.get("transactions", []):
+            listing_id = t.get("listing_id")
+            listing_url = f"https://www.etsy.com/listing/{listing_id}" if listing_id else None
+
+            thumbnail_url = None
+            if include_thumbnails and listing_id:
+                thumbnail_url = get_listing_thumbnail(listing_id)
+
+            variations_text = " | ".join(
+                f"{v.get('formatted_name')}: {v.get('formatted_value')}"
+                for v in t.get("variations", [])
+            )
+
+            expected_ship_ts = t.get("expected_ship_date")
+            days_until_deadline = (
+                round((expected_ship_ts - now) / 86400, 1) if expected_ship_ts else None
+            )
+
+            row = {
+                # Identifiants
+                "receipt_id": receipt_id,
+                "transaction_id": t.get("transaction_id"),
+                "listing_id": listing_id,
+
+                # Acheteur / livraison
+                "buyer_name": receipt.get("name"),
+                "buyer_email": receipt.get("buyer_email"),
+                "formatted_address": formatted_address,  # adresse complète prête pour étiquette
+                "address_line1": receipt.get("first_line"),
+                "address_line2": receipt.get("second_line"),
+                "city": receipt.get("city"),
+                "state": receipt.get("state"),
+                "zip": receipt.get("zip"),
+                "country": receipt.get("country_iso"),
+
+                # Article + personnalisation
+                "title": t.get("title"),
+                "quantity": t.get("quantity"),
+                "variations": variations_text,
+                "sku": t.get("sku"),
+                "listing_url": listing_url,
+                "thumbnail_url": thumbnail_url,
+
+                # Cadeau
+                "is_gift": receipt.get("is_gift"),
+                "gift_message": receipt.get("gift_message"),
+
+                # Messages
+                "message_from_buyer": receipt.get("message_from_buyer"),
+                "message_from_seller": receipt.get("message_from_seller"),
+
+                # Financier
+                "price": t.get("price", {}).get("amount", 0) / t.get("price", {}).get("divisor", 100),
+                "currency": t.get("price", {}).get("currency_code"),
+                "grandtotal": receipt.get("grandtotal", {}).get("amount", 0)
+                / receipt.get("grandtotal", {}).get("divisor", 100),
+                "shipping_cost": receipt.get("total_shipping_cost", {}).get("amount", 0)
+                / receipt.get("total_shipping_cost", {}).get("divisor", 100),
+
+                # Statut / urgence
+                "status": receipt.get("status"),
+                "is_paid": receipt.get("is_paid"),
+                "is_shipped": receipt.get("is_shipped"),
+                "created_timestamp": created_ts,
+                "days_since_order": days_since_order,
+                "expected_ship_date": expected_ship_ts,
+                "days_until_ship_deadline": days_until_deadline,
+                "is_late": days_until_deadline is not None and days_until_deadline < 0,
+            }
+
+            rows.append(row)
+
+    return {
+        "shop_id": shop_id,
+        "count_receipts_to_ship": len(receipts_data.get("results", [])),
         "count_rows": len(rows),
         "rows": rows,
     }
