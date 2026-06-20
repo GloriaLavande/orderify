@@ -5,7 +5,8 @@ Routes :
 - GET /                  -> health check
 - GET /authorize          -> génère l'URL d'autorisation Etsy (PKCE) et redirige vers Etsy
 - GET /callback           -> reçoit le code Etsy, l'échange contre access_token/refresh_token
-- GET /test-orders        -> utilise le dernier token obtenu pour récupérer les commandes du shop
+- GET /test-orders        -> JSON brut Etsy, pour debug
+- GET /orders-full        -> JSON PLAT (une ligne par article), prêt pour Google Sheets
 
 Variables d'environnement à définir sur Render (Environment) :
 - ETSY_API_KEY      = ton Keystring
@@ -95,7 +96,7 @@ def home():
         "status": "ok",
         "etape_1": "Va sur /authorize pour démarrer l'autorisation Etsy",
         "etape_2": "Etsy te redirigera vers /callback automatiquement",
-        "etape_3": "Va sur /test-orders pour tester un appel API",
+        "etape_3": "Va sur /test-orders pour le JSON brut, ou /orders-full pour le format Sheet-ready",
     }
 
 
@@ -276,4 +277,145 @@ def test_orders(limit: int = 10):
         "shop_id": shop_id,
         "status_code": receipts_resp.status_code,
         "data": receipts_data,
+    }
+
+
+def get_shop_id_for_user():
+    access_token = ensure_valid_token()
+    user_id = access_token.split(".")[0]
+
+    resp = requests.get(f"{API_BASE}/users/{user_id}/shops", headers=get_headers())
+    data = resp.json()
+
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"Erreur get_shops: {data}")
+
+    if "shop_id" in data:
+        return data["shop_id"]
+    elif "results" in data and data["results"]:
+        return data["results"][0]["shop_id"]
+    raise HTTPException(500, f"shop_id introuvable: {data}")
+
+
+# Cache mémoire simple pour éviter de re-demander la même image plusieurs fois
+# si plusieurs commandes pointent vers le même listing.
+_THUMBNAIL_CACHE = {}
+
+
+def get_listing_thumbnail(listing_id):
+    """Récupère l'URL de la miniature (image principale) d'un listing, avec cache."""
+    if listing_id in _THUMBNAIL_CACHE:
+        return _THUMBNAIL_CACHE[listing_id]
+
+    resp = requests.get(f"{API_BASE}/listings/{listing_id}/images", headers=get_headers())
+
+    if resp.status_code != 200:
+        _THUMBNAIL_CACHE[listing_id] = None
+        return None
+
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        _THUMBNAIL_CACHE[listing_id] = None
+        return None
+
+    # Etsy renvoie plusieurs tailles : url_75x75, url_170x135, url_570xN, url_fullxfull
+    first_image = results[0]
+    thumbnail_url = first_image.get("url_170x135") or first_image.get("url_75x75")
+    _THUMBNAIL_CACHE[listing_id] = thumbnail_url
+    return thumbnail_url
+
+
+@app.get("/orders-full")
+def orders_full(limit: int = 10, include_thumbnails: bool = True):
+    """
+    Récupère les dernières commandes et les renvoie sous forme de liste PLATE
+    (une ligne par article commandé), prête à être insérée dans Google Sheets.
+
+    Chaque ligne contient : commande, acheteur, adresse, article, prix, lien
+    listing, thumbnail, statut, dates, etc.
+
+    Paramètres :
+    - limit : nombre de commandes (receipts) à récupérer (pas le nombre de lignes)
+    - include_thumbnails : si False, ignore la récupération des images (plus rapide,
+      économise des appels API)
+    """
+    shop_id = get_shop_id_for_user()
+
+    receipts_resp = requests.get(
+        f"{API_BASE}/shops/{shop_id}/receipts",
+        headers=get_headers(),
+        params={"limit": limit, "sort_on": "created", "sort_order": "desc"},
+    )
+    receipts_data = receipts_resp.json()
+
+    if receipts_resp.status_code != 200:
+        return {"step": "get_receipts", "status_code": receipts_resp.status_code, "data": receipts_data}
+
+    rows = []
+
+    for receipt in receipts_data.get("results", []):
+        for t in receipt.get("transactions", []):
+            listing_id = t.get("listing_id")
+            listing_url = f"https://www.etsy.com/listing/{listing_id}" if listing_id else None
+
+            thumbnail_url = None
+            if include_thumbnails and listing_id:
+                thumbnail_url = get_listing_thumbnail(listing_id)
+
+            # Variations produit aplaties en texte lisible, ex: "Device: J9G29R | Style: ..."
+            variations_text = " | ".join(
+                f"{v.get('formatted_name')}: {v.get('formatted_value')}"
+                for v in t.get("variations", [])
+            )
+
+            row = {
+                # Identifiants
+                "receipt_id": receipt.get("receipt_id"),
+                "transaction_id": t.get("transaction_id"),
+                "listing_id": listing_id,
+
+                # Acheteur / livraison
+                "buyer_name": receipt.get("name"),
+                "buyer_email": receipt.get("buyer_email"),
+                "address_line1": receipt.get("first_line"),
+                "address_line2": receipt.get("second_line"),
+                "city": receipt.get("city"),
+                "state": receipt.get("state"),
+                "zip": receipt.get("zip"),
+                "country": receipt.get("country_iso"),
+
+                # Article
+                "title": t.get("title"),
+                "quantity": t.get("quantity"),
+                "variations": variations_text,
+                "listing_url": listing_url,
+                "thumbnail_url": thumbnail_url,
+
+                # Financier
+                "price": t.get("price", {}).get("amount", 0) / t.get("price", {}).get("divisor", 100),
+                "currency": t.get("price", {}).get("currency_code"),
+                "grandtotal": receipt.get("grandtotal", {}).get("amount", 0)
+                / receipt.get("grandtotal", {}).get("divisor", 100),
+                "shipping_cost": receipt.get("total_shipping_cost", {}).get("amount", 0)
+                / receipt.get("total_shipping_cost", {}).get("divisor", 100),
+                "discount": receipt.get("discount_amt", {}).get("amount", 0)
+                / receipt.get("discount_amt", {}).get("divisor", 100),
+
+                # Statut / dates
+                "status": receipt.get("status"),
+                "is_paid": receipt.get("is_paid"),
+                "is_shipped": receipt.get("is_shipped"),
+                "is_gift": receipt.get("is_gift"),
+                "created_timestamp": receipt.get("created_timestamp"),
+                "expected_ship_date": t.get("expected_ship_date"),
+            }
+
+            rows.append(row)
+
+    return {
+        "shop_id": shop_id,
+        "count_receipts": len(receipts_data.get("results", [])),
+        "count_rows": len(rows),
+        "rows": rows,
     }
