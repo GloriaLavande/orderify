@@ -321,8 +321,15 @@ def get_listing_thumbnail(listing_id):
         return None
 
     # Etsy renvoie plusieurs tailles : url_75x75, url_170x135, url_570xN, url_fullxfull
+    # On privilégie la haute résolution (url_fullxfull), avec repli sur les tailles
+    # plus petites si jamais elle n'est pas fournie pour ce listing.
     first_image = results[0]
-    thumbnail_url = first_image.get("url_170x135") or first_image.get("url_75x75")
+    thumbnail_url = (
+        first_image.get("url_fullxfull")
+        or first_image.get("url_570xN")
+        or first_image.get("url_170x135")
+        or first_image.get("url_75x75")
+    )
     _THUMBNAIL_CACHE[listing_id] = thumbnail_url
     return thumbnail_url
 
