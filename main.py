@@ -8,6 +8,8 @@ Routes :
 - GET /test-orders        -> JSON brut Etsy, pour debug
 - GET /orders-full        -> JSON PLAT (une ligne par article), prêt pour Google Sheets
 - GET /to-ship            -> Commandes payées non expédiées, infos complètes pour préparer l'envoi
+- POST /ship/{receipt_id} -> Marque une commande comme expédiée (tracking + transporteur)
+- GET /carriers           -> Liste des transporteurs reconnus par Etsy
 
 Variables d'environnement à définir sur Render (Environment) :
 - ETSY_API_KEY      = ton Keystring
@@ -32,7 +34,7 @@ CLIENT_ID = os.getenv("ETSY_API_KEY")
 CLIENT_SECRET = os.getenv("ETSY_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")  # ex: https://orderify-d26d.onrender.com/callback
 
-SCOPES = "transactions_r shops_r listings_r"
+SCOPES = "transactions_r transactions_w shops_r listings_r"
 
 AUTH_URL = "https://www.etsy.com/oauth/connect"
 TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
@@ -555,3 +557,64 @@ def to_ship(limit: int = 50, include_thumbnails: bool = True):
         "count_rows": len(rows),
         "rows": rows,
     }
+
+
+@app.post("/ship/{receipt_id}")
+def mark_as_shipped(
+    receipt_id: int,
+    tracking_code: str,
+    carrier_name: str,
+    note_to_buyer: str = None,
+):
+    """
+    Marque une commande comme expédiée en envoyant le tracking et le transporteur
+    à Etsy (endpoint officiel createReceiptShipment).
+
+    ⚠️ Nécessite le scope OAuth 'transactions_w' (refais /authorize si ton token
+    actuel n'a que 'transactions_r').
+
+    Paramètres :
+    - receipt_id : l'identifiant de la commande (dans le path)
+    - tracking_code : numéro de suivi fourni par le transporteur (query param)
+    - carrier_name : nom du transporteur, doit matcher un nom reconnu par Etsy
+      (ex: "la-poste", "ups", "fedex", "dhl" ... voir /carriers pour la liste)
+    - note_to_buyer : message optionnel envoyé à l'acheteur
+
+    Exemple d'appel :
+    POST /ship/4093301320?tracking_code=1Z999AA10123456784&carrier_name=ups
+    """
+    shop_id = get_shop_id_for_user()
+
+    payload = {
+        "tracking_code": tracking_code,
+        "carrier_name": carrier_name,
+    }
+    if note_to_buyer:
+        payload["note_to_buyer"] = note_to_buyer
+
+    resp = requests.post(
+        f"{API_BASE}/shops/{shop_id}/receipts/{receipt_id}/tracking",
+        headers=get_headers(),
+        data=payload,
+    )
+
+    data = resp.json()
+
+    if resp.status_code != 200:
+        return {"success": False, "status_code": resp.status_code, "error": data}
+
+    return {
+        "success": True,
+        "message": f"✅ Commande #{receipt_id} marquée comme expédiée",
+        "raw": data,
+    }
+
+
+@app.get("/carriers")
+def list_carriers():
+    """
+    Liste les transporteurs reconnus par Etsy pour le tracking (utile pour savoir
+    quelle valeur exacte donner à carrier_name dans /ship).
+    """
+    resp = requests.get(f"{API_BASE}/shipping-carriers", headers=get_headers(), params={"origin_country_iso": "FR"})
+    return resp.json()
