@@ -17,6 +17,8 @@ import base64
 import hashlib
 import secrets
 import os
+import json
+import time
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -35,14 +37,49 @@ TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 API_BASE = "https://openapi.etsy.com/v3/application"
 
 # --------------------------------------------------------------------
-# Stockage en mémoire (UNIQUEMENT pour test - pas pour la prod !)
-# Sur Render Free, le service peut redémarrer/dormir et tout effacer.
+# Stockage des tokens sur disque (tokens.json), pour survivre aux
+# redémarrages du service (le plan Render Free dort après inactivité).
+#
+# ⚠️ Sur Render Free, le disque n'est PAS persistant entre déploiements
+# (il est éphémère et peut être effacé à chaque redeploy). Pour une vraie
+# persistance long terme, il faudrait un Render Disk payant ou une DB.
+# Pour ce test, ce fichier survit au moins aux mises en veille/réveils
+# du service tant qu'il n'y a pas de nouveau déploiement.
 # --------------------------------------------------------------------
+TOKEN_FILE = "tokens.json"
+
 STATE = {
     "code_verifier": None,
     "access_token": None,
     "refresh_token": None,
+    "expires_at": None,  # timestamp Unix auquel l'access_token expire
 }
+
+
+def load_tokens_from_disk():
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                saved = json.load(f)
+                STATE.update(saved)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+
+def save_tokens_to_disk():
+    with open(TOKEN_FILE, "w") as f:
+        json.dump(
+            {
+                "access_token": STATE["access_token"],
+                "refresh_token": STATE["refresh_token"],
+                "expires_at": STATE["expires_at"],
+            },
+            f,
+        )
+
+
+# Charger les tokens existants au démarrage du service (s'ils existent)
+load_tokens_from_disk()
 
 
 def generate_pkce_pair():
@@ -121,6 +158,8 @@ def callback(code: str = None, error: str = None, error_description: str = None)
 
     STATE["access_token"] = data.get("access_token")
     STATE["refresh_token"] = data.get("refresh_token")
+    STATE["expires_at"] = time.time() + data.get("expires_in", 3600) - 60  # marge de sécurité 60s
+    save_tokens_to_disk()
 
     return {
         "message": "✅ Auth réussie. Va maintenant sur /test-orders",
@@ -128,33 +167,86 @@ def callback(code: str = None, error: str = None, error_description: str = None)
     }
 
 
-def get_headers():
+def refresh_access_token():
+    """Demande un nouveau access_token à Etsy via le refresh_token stocké."""
+    if not STATE["refresh_token"]:
+        raise HTTPException(400, "Pas de refresh_token en mémoire, refais /authorize d'abord")
+
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": CLIENT_ID,
+        "refresh_token": STATE["refresh_token"],
+    }
+    r = requests.post(TOKEN_URL, data=payload)
+    data = r.json()
+
+    if r.status_code != 200:
+        raise HTTPException(
+            401,
+            f"Échec du refresh du token (status {r.status_code}): {data}",
+        )
+
+    STATE["access_token"] = data.get("access_token")
+    STATE["refresh_token"] = data.get("refresh_token")  # Etsy peut renvoyer un nouveau refresh_token
+    STATE["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+    save_tokens_to_disk()
+
+    print("🔄 Access token rafraîchi automatiquement.")
+    return STATE["access_token"]
+
+
+def ensure_valid_token():
+    """Vérifie si le token est expiré (ou proche de l'expiration) et le rafraîchit si besoin."""
     if not STATE["access_token"]:
-        raise HTTPException(400, "Pas d'access_token en mémoire, refais /authorize d'abord")
+        raise HTTPException(400, "Pas de token, fais /authorize puis autorise l'app d'abord")
+
+    if STATE["expires_at"] is None or time.time() >= STATE["expires_at"]:
+        refresh_access_token()
+
+    return STATE["access_token"]
+
+
+def get_headers():
+    access_token = ensure_valid_token()
     return {
-        "Authorization": f"Bearer {STATE['access_token']}",
+        "Authorization": f"Bearer {access_token}",
         "x-api-key": f"{CLIENT_ID}:{CLIENT_SECRET}",
+    }
+
+
+@app.get("/refresh-token")
+def manual_refresh():
+    """Route manuelle pour forcer un refresh, utile pour tester que ça fonctionne."""
+    new_token = refresh_access_token()
+    return {
+        "message": "✅ Token rafraîchi avec succès",
+        "expires_at": STATE["expires_at"],
+        "access_token_preview": new_token[:20] + "...",
     }
 
 
 @app.get("/debug-env")
 def debug_env():
     """Vérifie que les variables d'environnement sont bien chargées (sans révéler les valeurs)."""
+    expires_in_seconds = None
+    if STATE["expires_at"]:
+        expires_in_seconds = round(STATE["expires_at"] - time.time())
+
     return {
         "CLIENT_ID_set": bool(CLIENT_ID),
         "CLIENT_ID_len": len(CLIENT_ID) if CLIENT_ID else 0,
         "CLIENT_SECRET_set": bool(CLIENT_SECRET),
         "REDIRECT_URI": REDIRECT_URI,
         "access_token_in_memory": bool(STATE["access_token"]),
+        "refresh_token_in_memory": bool(STATE["refresh_token"]),
+        "token_expires_in_seconds": expires_in_seconds,
     }
 
 
 @app.get("/test-orders")
 def test_orders(limit: int = 10):
     """Récupère les dernières commandes (receipts) du shop, pour vérifier que tout fonctionne."""
-    access_token = STATE["access_token"]
-    if not access_token:
-        raise HTTPException(400, "Pas de token, fais /authorize puis autorise l'app d'abord")
+    access_token = ensure_valid_token()  # rafraîchit automatiquement si expiré
 
     user_id = access_token.split(".")[0]
 
