@@ -133,7 +133,19 @@ def get_headers():
         raise HTTPException(400, "Pas d'access_token en mémoire, refais /authorize d'abord")
     return {
         "Authorization": f"Bearer {STATE['access_token']}",
-        "x-api-key": CLIENT_ID,
+        "x-api-key": f"{CLIENT_ID}:{CLIENT_SECRET}",
+    }
+
+
+@app.get("/debug-env")
+def debug_env():
+    """Vérifie que les variables d'environnement sont bien chargées (sans révéler les valeurs)."""
+    return {
+        "CLIENT_ID_set": bool(CLIENT_ID),
+        "CLIENT_ID_len": len(CLIENT_ID) if CLIENT_ID else 0,
+        "CLIENT_SECRET_set": bool(CLIENT_SECRET),
+        "REDIRECT_URI": REDIRECT_URI,
+        "access_token_in_memory": bool(STATE["access_token"]),
     }
 
 
