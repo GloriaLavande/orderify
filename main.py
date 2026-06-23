@@ -10,6 +10,7 @@ Routes :
 - GET /to-ship            -> Commandes payées non expédiées, infos complètes pour préparer l'envoi
 - POST /ship/{receipt_id} -> Marque une commande comme expédiée (tracking + transporteur)
 - GET /carriers           -> Liste des transporteurs reconnus par Etsy
+- GET /receipt-status/{receipt_id} -> Statut d'expédition d'une commande précise
 
 Variables d'environnement à définir sur Render (Environment) :
 - ETSY_API_KEY      = ton Keystring
@@ -618,3 +619,30 @@ def list_carriers():
     """
     resp = requests.get(f"{API_BASE}/shipping-carriers", headers=get_headers(), params={"origin_country_iso": "FR"})
     return resp.json()
+
+
+@app.get("/receipt-status/{receipt_id}")
+def receipt_status(receipt_id: int):
+    """
+    Renvoie le statut d'expédition d'UNE commande précise (is_shipped, is_paid,
+    status). Utile pour vérifier rapidement, commande par commande, si elle a
+    déjà été expédiée avant de tenter un /ship dessus.
+    """
+    shop_id = get_shop_id_for_user()
+
+    resp = requests.get(
+        f"{API_BASE}/shops/{shop_id}/receipts/{receipt_id}",
+        headers=get_headers(),
+    )
+    data = resp.json()
+
+    if resp.status_code != 200:
+        return {"success": False, "status_code": resp.status_code, "error": data}
+
+    return {
+        "success": True,
+        "receipt_id": data.get("receipt_id"),
+        "is_paid": data.get("is_paid"),
+        "is_shipped": data.get("is_shipped"),
+        "status": data.get("status"),
+    }
