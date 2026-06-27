@@ -646,3 +646,221 @@ def receipt_status(receipt_id: int):
         "is_shipped": data.get("is_shipped"),
         "status": data.get("status"),
     }
+
+"""
+À AJOUTER À LA FIN de main_bakcend_render.py (sur Render), juste après la
+route /receipt-status/{receipt_id} existante.
+
+Cette route ne modifie AUCUNE route existante. Elle ajoute :
+
+GET /listings-stats?days=30        -> ventes sur les 30 derniers jours
+GET /listings-stats?days=90        -> ventes sur les 90 derniers jours
+GET /listings-stats?days=lifetime  -> ventes depuis toujours (par défaut)
+
+Pour CHAQUE listing actif de la boutique, renvoie :
+- les infos du listing (titre, description, tags, matériaux, prix, catégorie,
+  date de création/mise à jour, views lifetime, num_favorers)
+- les ventes calculées sur la période demandée (quantité vendue, revenu),
+  même si elles sont à 0 (listing jamais vendu inclus)
+
+⚠️ Limite connue de l'API Etsy : le champ "views" renvoyé par Etsy est un
+total LIFETIME, pas un total sur la période choisie. Il n'existe pas
+d'endpoint Etsy pour des vues "sur les 30 derniers jours" (voir doc Etsy /
+GitHub open-api discussions #1304 et #1386). Les ventes, elles, SONT
+calculées sur la période choisie car on les recompte nous-mêmes à partir
+des receipts.
+"""
+
+import time
+from datetime import datetime, timedelta
+
+import requests
+from fastapi import HTTPException
+
+# Ces noms (API_BASE, get_headers, get_shop_id_for_user) existent déjà dans
+# main_bakcend_render.py : ce fichier n'est PAS un module à importer, c'est
+# du texte à copier-coller à la suite du fichier existant.
+
+
+@app.get("/listings-stats")
+def listings_stats(days: str = "lifetime"):
+    """
+    Récupère tous les listings ACTIFS de la boutique avec leurs infos
+    complètes + leurs ventes calculées sur la période choisie.
+
+    Paramètre :
+    - days : "30", "90" ou "lifetime" (défaut). Détermine la fenêtre sur
+      laquelle on additionne les ventes (quantité + revenu) par listing.
+      N'affecte PAS le champ "views" (toujours lifetime, limite Etsy).
+    """
+    if days not in ("30", "90", "lifetime"):
+        raise HTTPException(400, "Paramètre 'days' invalide : utilise 30, 90 ou lifetime")
+
+    shop_id = get_shop_id_for_user()
+
+    # ------------------------------------------------------------------
+    # 1) Récupérer TOUS les listings actifs (pagination par lots de 100)
+    # ------------------------------------------------------------------
+    all_listings = []
+    offset = 0
+    page_size = 100
+
+    while True:
+        resp = requests.get(
+            f"{API_BASE}/shops/{shop_id}/listings",
+            headers=get_headers(),
+            params={
+                "state": "active",
+                "limit": page_size,
+                "offset": offset,
+                "includes": "Tags,Images",  # tags + images en un seul appel
+            },
+        )
+        data = resp.json()
+
+        if resp.status_code != 200:
+            return {"step": "get_listings", "status_code": resp.status_code, "data": data}
+
+        results = data.get("results", [])
+        all_listings.extend(results)
+
+        if len(results) < page_size:
+            break  # dernière page atteinte
+        offset += page_size
+
+    # ------------------------------------------------------------------
+    # 2) Récupérer les receipts payés sur la période demandée, et agréger
+    #    les ventes (quantité + revenu) par listing_id
+    # ------------------------------------------------------------------
+    sales_by_listing = {}  # listing_id -> {"quantity": int, "revenue": float, "orders": int}
+
+    receipt_params = {
+        "limit": 100,
+        "was_paid": "true",
+        "sort_on": "created",
+        "sort_order": "desc",
+    }
+
+    if days != "lifetime":
+        cutoff_ts = int(time.time() - int(days) * 86400)
+        receipt_params["min_created"] = cutoff_ts
+
+    receipt_offset = 0
+    while True:
+        receipt_params["offset"] = receipt_offset
+        resp = requests.get(
+            f"{API_BASE}/shops/{shop_id}/receipts",
+            headers=get_headers(),
+            params=receipt_params,
+        )
+        data = resp.json()
+
+        if resp.status_code != 200:
+            return {"step": "get_receipts", "status_code": resp.status_code, "data": data}
+
+        results = data.get("results", [])
+
+        for receipt in results:
+            for t in receipt.get("transactions", []):
+                listing_id = t.get("listing_id")
+                if listing_id is None:
+                    continue
+
+                qty = t.get("quantity", 0) or 0
+                price = t.get("price", {}) or {}
+                revenue = (price.get("amount", 0) or 0) / (price.get("divisor", 100) or 100) * qty
+
+                if listing_id not in sales_by_listing:
+                    sales_by_listing[listing_id] = {"quantity": 0, "revenue": 0.0, "orders": 0}
+
+                sales_by_listing[listing_id]["quantity"] += qty
+                sales_by_listing[listing_id]["revenue"] += revenue
+                sales_by_listing[listing_id]["orders"] += 1
+
+        if len(results) < receipt_params["limit"]:
+            break
+        receipt_offset += receipt_params["limit"]
+
+        # Filet de sécurité : au-delà de 5000 receipts scannés, on arrête
+        # pour éviter une boucle trop longue sur une vieille boutique.
+        if receipt_offset >= 5000:
+            break
+
+    # ------------------------------------------------------------------
+    # 3) Construire la liste finale : un objet complet par listing
+    # ------------------------------------------------------------------
+    rows = []
+
+    for listing in all_listings:
+        listing_id = listing.get("listing_id")
+
+        tags = listing.get("tags") or []
+        materials = listing.get("materials") or []
+
+        images = listing.get("images") or []
+        thumbnail_url = None
+        if images:
+            first_image = images[0]
+            thumbnail_url = (
+                first_image.get("url_fullxfull")
+                or first_image.get("url_570xN")
+                or first_image.get("url_170x135")
+            )
+
+        price_info = listing.get("price") or {}
+        price = (price_info.get("amount", 0) or 0) / (price_info.get("divisor", 100) or 100)
+
+        created_ts = listing.get("original_creation_timestamp")
+        updated_ts = listing.get("last_modified_timestamp")
+
+        sales = sales_by_listing.get(listing_id, {"quantity": 0, "revenue": 0.0, "orders": 0})
+
+        rows.append({
+            # Identifiants
+            "listing_id": listing_id,
+            "listing_url": listing.get("url") or (f"https://www.etsy.com/listing/{listing_id}" if listing_id else None),
+
+            # Contenu (le plus utile pour analyser "pourquoi ça marche")
+            "title": listing.get("title"),
+            "description": listing.get("description"),
+            "tags": tags,
+            "materials": materials,
+            "category_path": listing.get("taxonomy_id"),
+            "thumbnail_url": thumbnail_url,
+
+            # Prix / offre
+            "price": price,
+            "currency": price_info.get("currency_code"),
+            "quantity_available": listing.get("quantity"),
+            "who_made": listing.get("who_made"),
+            "when_made": listing.get("when_made"),
+            "is_customizable": listing.get("is_customizable"),
+            "is_personalizable": listing.get("is_personalizable"),
+
+            # Stats natives Etsy (LIFETIME, limite connue de l'API)
+            "views_lifetime": listing.get("views"),
+            "num_favorers": listing.get("num_favorers"),
+
+            # Ventes calculées par nous (sur la période demandée)
+            "sales_quantity": sales["quantity"],
+            "sales_revenue": round(sales["revenue"], 2),
+            "sales_orders_count": sales["orders"],
+            "sales_period_days": days,
+
+            # Dates
+            "created_timestamp": created_ts,
+            "created_date": datetime.fromtimestamp(created_ts).strftime("%Y-%m-%d") if created_ts else None,
+            "last_modified_timestamp": updated_ts,
+            "last_modified_date": datetime.fromtimestamp(updated_ts).strftime("%Y-%m-%d") if updated_ts else None,
+
+            "state": listing.get("state"),
+        })
+
+    return {
+        "shop_id": shop_id,
+        "sales_period_days": days,
+        "count_listings": len(rows),
+        "note": "views_lifetime est un total depuis toujours (limite API Etsy, pas de vues par période). "
+                "sales_quantity / sales_revenue / sales_orders_count sont calculés sur la période demandée.",
+        "rows": rows,
+    }
