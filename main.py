@@ -713,7 +713,7 @@ def listings_stats(days: str = "lifetime"):
                 "state": "active",
                 "limit": page_size,
                 "offset": offset,
-                "includes": "Tags,Images",  # tags + images en un seul appel
+                "includes": "images",  # tags est déjà un champ natif du listing, pas besoin de l'inclure
             },
         )
         data = resp.json()
