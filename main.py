@@ -11,6 +11,7 @@ Routes :
 - POST /ship/{receipt_id} -> Marque une commande comme expédiée (tracking + transporteur)
 - GET /carriers           -> Liste des transporteurs reconnus par Etsy
 - GET /receipt-status/{receipt_id} -> Statut d'expédition d'une commande précise
+- GET /receipt/{receipt_id} -> Détails complets d'une commande, même déjà expédiée
 
 Variables d'environnement à définir sur Render (Environment) :
 - ETSY_API_KEY      = ton Keystring
@@ -645,6 +646,88 @@ def receipt_status(receipt_id: int):
         "is_paid": data.get("is_paid"),
         "is_shipped": data.get("is_shipped"),
         "status": data.get("status"),
+    }
+
+
+@app.get("/receipt/{receipt_id}")
+def receipt_details(receipt_id: int, include_thumbnails: bool = True):
+    """Renvoie une commande précise, qu'elle soit expédiée ou non."""
+    shop_id = get_shop_id_for_user()
+    resp = requests.get(
+        f"{API_BASE}/shops/{shop_id}/receipts/{receipt_id}",
+        headers=get_headers(),
+    )
+    receipt = resp.json()
+
+    if resp.status_code != 200:
+        detail = receipt.get("error") if isinstance(receipt, dict) else receipt
+        raise HTTPException(resp.status_code, detail or "Commande introuvable")
+
+    now = time.time()
+    created_ts = receipt.get("created_timestamp")
+    days_since_order = round((now - created_ts) / 86400, 1) if created_ts else None
+    rows = []
+
+    for transaction in receipt.get("transactions", []):
+        listing_id = transaction.get("listing_id")
+        thumbnail_url = None
+        if include_thumbnails and listing_id:
+            thumbnail_url = get_listing_thumbnail(listing_id)
+
+        variations_text = " | ".join(
+            f"{variation.get('formatted_name')}: {variation.get('formatted_value')}"
+            for variation in transaction.get("variations", [])
+        )
+        expected_ship_ts = transaction.get("expected_ship_date")
+        days_until_deadline = (
+            round((expected_ship_ts - now) / 86400, 1) if expected_ship_ts else None
+        )
+
+        rows.append({
+            "receipt_id": receipt.get("receipt_id"),
+            "transaction_id": transaction.get("transaction_id"),
+            "listing_id": listing_id,
+            "buyer_name": receipt.get("name"),
+            "buyer_email": receipt.get("buyer_email"),
+            "formatted_address": receipt.get("formatted_address"),
+            "address_line1": receipt.get("first_line"),
+            "address_line2": receipt.get("second_line"),
+            "city": receipt.get("city"),
+            "state": receipt.get("state"),
+            "zip": receipt.get("zip"),
+            "country": receipt.get("country_iso"),
+            "title": transaction.get("title"),
+            "quantity": transaction.get("quantity"),
+            "variations": variations_text,
+            "sku": transaction.get("sku"),
+            "listing_url": f"https://www.etsy.com/listing/{listing_id}" if listing_id else None,
+            "thumbnail_url": thumbnail_url,
+            "is_gift": receipt.get("is_gift"),
+            "gift_message": receipt.get("gift_message"),
+            "message_from_buyer": receipt.get("message_from_buyer"),
+            "message_from_seller": receipt.get("message_from_seller"),
+            "price": transaction.get("price", {}).get("amount", 0)
+            / transaction.get("price", {}).get("divisor", 100),
+            "currency": transaction.get("price", {}).get("currency_code"),
+            "grandtotal": receipt.get("grandtotal", {}).get("amount", 0)
+            / receipt.get("grandtotal", {}).get("divisor", 100),
+            "shipping_cost": receipt.get("total_shipping_cost", {}).get("amount", 0)
+            / receipt.get("total_shipping_cost", {}).get("divisor", 100),
+            "status": receipt.get("status"),
+            "is_paid": receipt.get("is_paid"),
+            "is_shipped": receipt.get("is_shipped"),
+            "created_timestamp": created_ts,
+            "days_since_order": days_since_order,
+            "expected_ship_date": expected_ship_ts,
+            "days_until_ship_deadline": days_until_deadline,
+            "is_late": days_until_deadline is not None and days_until_deadline < 0,
+        })
+
+    return {
+        "shop_id": shop_id,
+        "receipt_id": receipt.get("receipt_id"),
+        "count_rows": len(rows),
+        "rows": rows,
     }
 
 """
