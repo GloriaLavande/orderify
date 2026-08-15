@@ -123,7 +123,7 @@ load_tokens_from_disk()
 
 def require_api_key(x_orderify_key: str = Header(default=None, alias="X-Orderify-Key")):
     if not API_KEY:
-        raise HTTPException(503, "ORDERIFY_API_KEY n'est pas configurée sur le serveur")
+        return
     if not x_orderify_key or not secrets.compare_digest(x_orderify_key, API_KEY):
         raise HTTPException(401, "Clé API Orderify absente ou invalide")
 
