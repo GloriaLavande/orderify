@@ -1,688 +1,256 @@
-"""
-main.py - Orderify : test OAuth Etsy v3 (PKCE) + récupération des commandes
-
-Routes :
-- GET /                  -> health check
-- GET /authorize          -> génère l'URL d'autorisation Etsy (PKCE) et redirige vers Etsy
-- GET /callback           -> reçoit le code Etsy, l'échange contre access_token/refresh_token
-- GET /test-orders        -> JSON brut Etsy, pour debug
-- GET /orders-full        -> JSON PLAT (une ligne par article), prêt pour Google Sheets
-- GET /to-ship            -> Commandes payées non expédiées, infos complètes pour préparer l'envoi
-- POST /ship/{receipt_id} -> Marque une commande comme expédiée (tracking + transporteur)
-- GET /carriers           -> Liste des transporteurs reconnus par Etsy
-- GET /receipt-status/{receipt_id} -> Statut d'expédition d'une commande précise
-- GET /receipt/{receipt_id} -> Détails complets d'une commande, même déjà expédiée
-
-Variables d'environnement à définir sur Render (Environment) :
-- ETSY_API_KEY      = ton Keystring
-- ETSY_SECRET       = ton Shared Secret
-- REDIRECT_URI      = https://orderify-d26d.onrender.com/callback
-"""
+"""Orderify backend: production gateway between local tools and Etsy Open API v3."""
 
 import base64
 import hashlib
-import secrets
-import os
 import json
+import os
+import secrets
+import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-app = FastAPI()
+
+APP_NAME = "Orderify API"
+APP_VERSION = "3.0.0"
+STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
 CLIENT_SECRET = os.getenv("ETSY_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")  # ex: https://orderify-d26d.onrender.com/callback
+REDIRECT_URI = os.getenv("REDIRECT_URI")
+API_KEY = os.getenv("ORDERIFY_API_KEY")
+ENV_REFRESH_TOKEN = os.getenv("ETSY_REFRESH_TOKEN")
 
 SCOPES = "transactions_r transactions_w shops_r listings_r"
-
 AUTH_URL = "https://www.etsy.com/oauth/connect"
 TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 API_BASE = "https://openapi.etsy.com/v3/application"
+REQUEST_TIMEOUT = max(10, int(os.getenv("ETSY_REQUEST_TIMEOUT", "45")))
+TOKEN_FILE = Path(os.getenv("ETSY_TOKEN_FILE", "tokens.json"))
+INDEX_FILE = Path(__file__).with_name("index.html")
 
-# --------------------------------------------------------------------
-# Stockage des tokens sur disque (tokens.json), pour survivre aux
-# redémarrages du service (le plan Render Free dort après inactivité).
-#
-# ⚠️ Sur Render Free, le disque n'est PAS persistant entre déploiements
-# (il est éphémère et peut être effacé à chaque redeploy). Pour une vraie
-# persistance long terme, il faudrait un Render Disk payant ou une DB.
-# Pour ce test, ce fichier survit au moins aux mises en veille/réveils
-# du service tant qu'il n'y a pas de nouveau déploiement.
-# --------------------------------------------------------------------
-TOKEN_FILE = "tokens.json"
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="Passerelle sécurisée pour les commandes, expéditions et statistiques Etsy d’Orderify.",
+    openapi_tags=[
+        {"name": "service", "description": "État et configuration non sensible du service."},
+        {"name": "oauth", "description": "Autorisation OAuth Etsy."},
+        {"name": "orders", "description": "Commandes et articles Etsy."},
+        {"name": "shipping", "description": "Suivi et transporteurs."},
+        {"name": "analytics", "description": "Données et statistiques des listings."},
+        {"name": "admin", "description": "Actions administratives protégées."},
+    ],
+)
 
 STATE = {
     "code_verifier": None,
+    "oauth_state": None,
+    "oauth_started_at": None,
     "access_token": None,
-    "refresh_token": None,
-    "expires_at": None,  # timestamp Unix auquel l'access_token expire
+    "refresh_token": ENV_REFRESH_TOKEN,
+    "expires_at": None,
+    "shop_id": None,
 }
+_TOKEN_LOCK = threading.RLock()
+_THUMBNAIL_CACHE = {}
+
+
+def _build_etsy_session():
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    session = requests.Session()
+    session.headers.update({"Accept": "application/json", "User-Agent": f"Orderify/{APP_VERSION}"})
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+ETSY_SESSION = _build_etsy_session()
+
+
+def _safe_json(response):
+    try:
+        return response.json()
+    except ValueError:
+        return {"message": "Réponse Etsy non JSON", "body": response.text[:500]}
 
 
 def load_tokens_from_disk():
-    if os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE, "r") as f:
-                saved = json.load(f)
-                STATE.update(saved)
-        except (json.JSONDecodeError, OSError):
-            pass
+    if not TOKEN_FILE.exists():
+        return
+    try:
+        saved = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    for key in ("access_token", "refresh_token", "expires_at"):
+        if saved.get(key) is not None:
+            STATE[key] = saved[key]
 
 
 def save_tokens_to_disk():
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(
-            {
-                "access_token": STATE["access_token"],
-                "refresh_token": STATE["refresh_token"],
-                "expires_at": STATE["expires_at"],
-            },
-            f,
-        )
+    payload = {
+        "access_token": STATE["access_token"],
+        "refresh_token": STATE["refresh_token"],
+        "expires_at": STATE["expires_at"],
+    }
+    temporary_file = TOKEN_FILE.with_suffix(TOKEN_FILE.suffix + ".tmp")
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary_file, TOKEN_FILE)
+    except OSError:
+        # Render peut utiliser un disque éphémère; le token reste alors en mémoire.
+        pass
 
 
-# Charger les tokens existants au démarrage du service (s'ils existent)
 load_tokens_from_disk()
 
 
+def require_api_key(x_orderify_key: str = Header(default=None, alias="X-Orderify-Key")):
+    if not API_KEY:
+        raise HTTPException(503, "ORDERIFY_API_KEY n'est pas configurée sur le serveur")
+    if not x_orderify_key or not secrets.compare_digest(x_orderify_key, API_KEY):
+        raise HTTPException(401, "Clé API Orderify absente ou invalide")
+
+
+PROTECTED = [Depends(require_api_key)]
+
+
 def generate_pkce_pair():
-    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("utf-8").rstrip("=")
-    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
-    code_challenge = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
     return code_verifier, code_challenge
 
 
-@app.get("/")
-def home():
-    return {
-        "status": "ok",
-        "etape_1": "Va sur /authorize pour démarrer l'autorisation Etsy",
-        "etape_2": "Etsy te redirigera vers /callback automatiquement",
-        "etape_3": "Va sur /test-orders pour le JSON brut, ou /orders-full pour le format Sheet-ready",
-    }
-
-
-@app.get("/authorize")
-def authorize():
-    if not CLIENT_ID or not REDIRECT_URI:
-        raise HTTPException(500, "ETSY_API_KEY ou REDIRECT_URI manquant dans les variables d'environnement")
-
-    code_verifier, code_challenge = generate_pkce_pair()
-    STATE["code_verifier"] = code_verifier  # on le garde pour /callback
-
-    state = secrets.token_urlsafe(16)
-
-    params = {
-        "response_type": "code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "scope": SCOPES,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-    }
-    query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
-    full_url = f"{AUTH_URL}?{query}"
-
-    return RedirectResponse(full_url)
-
-
-@app.get("/callback")
-def callback(code: str = None, error: str = None, error_description: str = None):
-    if error:
-        return {"error": error, "error_description": error_description}
-
-    if not code:
-        raise HTTPException(400, "Pas de 'code' reçu dans l'URL de callback")
-
-    if not STATE["code_verifier"]:
-        raise HTTPException(
-            400,
-            "Pas de code_verifier en mémoire. As-tu bien démarré le flow via /authorize "
-            "(et pas une URL collée à la main) ? Le service a peut-être aussi redémarré entre temps.",
-        )
-
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "code": code,
-        "code_verifier": STATE["code_verifier"],
-    }
-
-    r = requests.post(TOKEN_URL, data=payload)
-    data = r.json()
-
-    print("STATUS:", r.status_code)
-    print("RESPONSE:", data)
-
-    if r.status_code != 200:
-        return {"status_code": r.status_code, "error_from_etsy": data}
-
-    STATE["access_token"] = data.get("access_token")
-    STATE["refresh_token"] = data.get("refresh_token")
-    STATE["expires_at"] = time.time() + data.get("expires_in", 3600) - 60  # marge de sécurité 60s
-    save_tokens_to_disk()
-
-    return {
-        "message": "✅ Auth réussie. Va maintenant sur /test-orders",
-        "raw": data,
-    }
-
-
 def refresh_access_token():
-    """Demande un nouveau access_token à Etsy via le refresh_token stocké."""
-    if not STATE["refresh_token"]:
-        raise HTTPException(400, "Pas de refresh_token en mémoire, refais /authorize d'abord")
+    with _TOKEN_LOCK:
+        refresh_token = STATE.get("refresh_token") or ENV_REFRESH_TOKEN
+        if not refresh_token:
+            raise HTTPException(401, "Autorisation Etsy requise via /authorize")
 
-    payload = {
-        "grant_type": "refresh_token",
-        "client_id": CLIENT_ID,
-        "refresh_token": STATE["refresh_token"],
-    }
-    r = requests.post(TOKEN_URL, data=payload)
-    data = r.json()
-
-    if r.status_code != 200:
-        raise HTTPException(
-            401,
-            f"Échec du refresh du token (status {r.status_code}): {data}",
+        response = ETSY_SESSION.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": refresh_token,
+            },
+            timeout=REQUEST_TIMEOUT,
         )
+        data = _safe_json(response)
+        if response.status_code != 200:
+            raise HTTPException(401, f"Impossible de renouveler l'autorisation Etsy: {data}")
 
-    STATE["access_token"] = data.get("access_token")
-    STATE["refresh_token"] = data.get("refresh_token")  # Etsy peut renvoyer un nouveau refresh_token
-    STATE["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
-    save_tokens_to_disk()
-
-    print("🔄 Access token rafraîchi automatiquement.")
-    return STATE["access_token"]
+        STATE["access_token"] = data.get("access_token")
+        STATE["refresh_token"] = data.get("refresh_token") or refresh_token
+        STATE["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+        save_tokens_to_disk()
+        return STATE["access_token"]
 
 
 def ensure_valid_token():
-    """Vérifie si le token est expiré (ou proche de l'expiration) et le rafraîchit si besoin."""
-    if not STATE["access_token"]:
-        raise HTTPException(400, "Pas de token, fais /authorize puis autorise l'app d'abord")
-
-    if STATE["expires_at"] is None or time.time() >= STATE["expires_at"]:
-        refresh_access_token()
-
-    return STATE["access_token"]
+    with _TOKEN_LOCK:
+        if STATE.get("access_token") and STATE.get("expires_at", 0) > time.time():
+            return STATE["access_token"]
+        return refresh_access_token()
 
 
 def get_headers():
-    access_token = ensure_valid_token()
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise HTTPException(503, "Configuration Etsy incomplète sur le serveur")
     return {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {ensure_valid_token()}",
         "x-api-key": f"{CLIENT_ID}:{CLIENT_SECRET}",
     }
 
 
-@app.get("/refresh-token")
-def manual_refresh():
-    """Route manuelle pour forcer un refresh, utile pour tester que ça fonctionne."""
-    new_token = refresh_access_token()
-    return {
-        "message": "✅ Token rafraîchi avec succès",
-        "expires_at": STATE["expires_at"],
-        "access_token_preview": new_token[:20] + "...",
-    }
+def etsy_request(method, path, *, params=None, data=None, authenticated=True):
+    url = path if path.startswith("http") else f"{API_BASE}{path}"
+    headers = get_headers() if authenticated else None
+    try:
+        response = ETSY_SESSION.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            data=data,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"Etsy est momentanément inaccessible: {exc}") from exc
+    return response, _safe_json(response)
 
 
-@app.get("/debug-env")
-def debug_env():
-    """Vérifie que les variables d'environnement sont bien chargées (sans révéler les valeurs)."""
-    expires_in_seconds = None
-    if STATE["expires_at"]:
-        expires_in_seconds = round(STATE["expires_at"] - time.time())
-
-    return {
-        "CLIENT_ID_set": bool(CLIENT_ID),
-        "CLIENT_ID_len": len(CLIENT_ID) if CLIENT_ID else 0,
-        "CLIENT_SECRET_set": bool(CLIENT_SECRET),
-        "REDIRECT_URI": REDIRECT_URI,
-        "access_token_in_memory": bool(STATE["access_token"]),
-        "refresh_token_in_memory": bool(STATE["refresh_token"]),
-        "token_expires_in_seconds": expires_in_seconds,
-    }
-
-
-@app.get("/test-orders")
-def test_orders(limit: int = 10):
-    """Récupère les dernières commandes (receipts) du shop, pour vérifier que tout fonctionne."""
-    access_token = ensure_valid_token()  # rafraîchit automatiquement si expiré
-
-    user_id = access_token.split(".")[0]
-
-    # 1) Récupérer le shop_id de l'utilisateur
-    shops_resp = requests.get(f"{API_BASE}/users/{user_id}/shops", headers=get_headers())
-    shops_data = shops_resp.json()
-
-    if shops_resp.status_code != 200:
-        return {"step": "get_shops", "status_code": shops_resp.status_code, "data": shops_data}
-
-    if "shop_id" in shops_data:
-        shop_id = shops_data["shop_id"]
-    elif "results" in shops_data and shops_data["results"]:
-        shop_id = shops_data["results"][0]["shop_id"]
-    else:
-        return {"step": "get_shops", "error": "shop_id introuvable", "raw": shops_data}
-
-    # 2) Récupérer les dernières commandes du shop
-    receipts_resp = requests.get(
-        f"{API_BASE}/shops/{shop_id}/receipts",
-        headers=get_headers(),
-        params={"limit": limit, "sort_on": "created", "sort_order": "desc"},
-    )
-    receipts_data = receipts_resp.json()
-
-    return {
-        "shop_id": shop_id,
-        "status_code": receipts_resp.status_code,
-        "data": receipts_data,
-    }
+def require_etsy_success(response, data, operation):
+    if response.status_code >= 400:
+        detail = data.get("error") or data.get("message") if isinstance(data, dict) else data
+        raise HTTPException(response.status_code, f"{operation}: {detail or 'erreur Etsy'}")
 
 
 def get_shop_id_for_user():
+    if STATE.get("shop_id"):
+        return STATE["shop_id"]
     access_token = ensure_valid_token()
     user_id = access_token.split(".")[0]
-
-    resp = requests.get(f"{API_BASE}/users/{user_id}/shops", headers=get_headers())
-    data = resp.json()
-
-    if resp.status_code != 200:
-        raise HTTPException(resp.status_code, f"Erreur get_shops: {data}")
-
-    if "shop_id" in data:
-        return data["shop_id"]
-    elif "results" in data and data["results"]:
-        return data["results"][0]["shop_id"]
-    raise HTTPException(500, f"shop_id introuvable: {data}")
-
-
-# Cache mémoire simple pour éviter de re-demander la même image plusieurs fois
-# si plusieurs commandes pointent vers le même listing.
-_THUMBNAIL_CACHE = {}
+    response, data = etsy_request("GET", f"/users/{user_id}/shops")
+    require_etsy_success(response, data, "Récupération de la boutique")
+    shop_id = data.get("shop_id")
+    if not shop_id and data.get("results"):
+        shop_id = data["results"][0].get("shop_id")
+    if not shop_id:
+        raise HTTPException(502, "Aucune boutique Etsy associée à cette autorisation")
+    STATE["shop_id"] = shop_id
+    return shop_id
 
 
 def get_listing_thumbnail(listing_id):
-    """Récupère l'URL de la miniature (image principale) d'un listing, avec cache."""
     if listing_id in _THUMBNAIL_CACHE:
         return _THUMBNAIL_CACHE[listing_id]
-
-    resp = requests.get(f"{API_BASE}/listings/{listing_id}/images", headers=get_headers())
-
-    if resp.status_code != 200:
+    response, data = etsy_request("GET", f"/listings/{listing_id}/images")
+    if response.status_code != 200 or not data.get("results"):
         _THUMBNAIL_CACHE[listing_id] = None
         return None
-
-    data = resp.json()
-    results = data.get("results", [])
-    if not results:
-        _THUMBNAIL_CACHE[listing_id] = None
-        return None
-
-    # Etsy renvoie plusieurs tailles : url_75x75, url_170x135, url_570xN, url_fullxfull
-    # On privilégie la haute résolution (url_fullxfull), avec repli sur les tailles
-    # plus petites si jamais elle n'est pas fournie pour ce listing.
-    first_image = results[0]
-    thumbnail_url = (
-        first_image.get("url_fullxfull")
-        or first_image.get("url_570xN")
-        or first_image.get("url_170x135")
-        or first_image.get("url_75x75")
-    )
-    _THUMBNAIL_CACHE[listing_id] = thumbnail_url
-    return thumbnail_url
+    image = data["results"][0]
+    url = image.get("url_fullxfull") or image.get("url_570xN") or image.get("url_170x135") or image.get("url_75x75")
+    _THUMBNAIL_CACHE[listing_id] = url
+    return url
 
 
-@app.get("/orders-full")
-def orders_full(limit: int = 10, include_thumbnails: bool = True):
-    """
-    Récupère les dernières commandes et les renvoie sous forme de liste PLATE
-    (une ligne par article commandé), prête à être insérée dans Google Sheets.
-
-    Chaque ligne contient : commande, acheteur, adresse, article, prix, lien
-    listing, thumbnail, statut, dates, etc.
-
-    Paramètres :
-    - limit : nombre de commandes (receipts) à récupérer (pas le nombre de lignes)
-    - include_thumbnails : si False, ignore la récupération des images (plus rapide,
-      économise des appels API)
-    """
-    shop_id = get_shop_id_for_user()
-
-    receipts_resp = requests.get(
-        f"{API_BASE}/shops/{shop_id}/receipts",
-        headers=get_headers(),
-        params={"limit": limit, "sort_on": "created", "sort_order": "desc"},
-    )
-    receipts_data = receipts_resp.json()
-
-    if receipts_resp.status_code != 200:
-        return {"step": "get_receipts", "status_code": receipts_resp.status_code, "data": receipts_data}
-
-    rows = []
-
-    for receipt in receipts_data.get("results", []):
-        for t in receipt.get("transactions", []):
-            listing_id = t.get("listing_id")
-            listing_url = f"https://www.etsy.com/listing/{listing_id}" if listing_id else None
-
-            thumbnail_url = None
-            if include_thumbnails and listing_id:
-                thumbnail_url = get_listing_thumbnail(listing_id)
-
-            # Variations produit aplaties en texte lisible, ex: "Device: J9G29R | Style: ..."
-            variations_text = " | ".join(
-                f"{v.get('formatted_name')}: {v.get('formatted_value')}"
-                for v in t.get("variations", [])
-            )
-
-            row = {
-                # Identifiants
-                "receipt_id": receipt.get("receipt_id"),
-                "transaction_id": t.get("transaction_id"),
-                "listing_id": listing_id,
-
-                # Acheteur / livraison
-                "buyer_name": receipt.get("name"),
-                "buyer_email": receipt.get("buyer_email"),
-                "address_line1": receipt.get("first_line"),
-                "address_line2": receipt.get("second_line"),
-                "city": receipt.get("city"),
-                "state": receipt.get("state"),
-                "zip": receipt.get("zip"),
-                "country": receipt.get("country_iso"),
-
-                # Article
-                "title": t.get("title"),
-                "quantity": t.get("quantity"),
-                "variations": variations_text,
-                "listing_url": listing_url,
-                "thumbnail_url": thumbnail_url,
-
-                # Financier
-                "price": t.get("price", {}).get("amount", 0) / t.get("price", {}).get("divisor", 100),
-                "currency": t.get("price", {}).get("currency_code"),
-                "grandtotal": receipt.get("grandtotal", {}).get("amount", 0)
-                / receipt.get("grandtotal", {}).get("divisor", 100),
-                "shipping_cost": receipt.get("total_shipping_cost", {}).get("amount", 0)
-                / receipt.get("total_shipping_cost", {}).get("divisor", 100),
-                "discount": receipt.get("discount_amt", {}).get("amount", 0)
-                / receipt.get("discount_amt", {}).get("divisor", 100),
-
-                # Statut / dates
-                "status": receipt.get("status"),
-                "is_paid": receipt.get("is_paid"),
-                "is_shipped": receipt.get("is_shipped"),
-                "is_gift": receipt.get("is_gift"),
-                "created_timestamp": receipt.get("created_timestamp"),
-                "expected_ship_date": t.get("expected_ship_date"),
-            }
-
-            rows.append(row)
-
-    return {
-        "shop_id": shop_id,
-        "count_receipts": len(receipts_data.get("results", [])),
-        "count_rows": len(rows),
-        "rows": rows,
-    }
+def money_value(value):
+    value = value or {}
+    return (value.get("amount", 0) or 0) / (value.get("divisor", 100) or 100)
 
 
-@app.get("/to-ship")
-def to_ship(limit: int = 50, include_thumbnails: bool = True):
-    """
-    Liste TOUTES les commandes payées mais pas encore expédiées (was_shipped=false),
-    avec le maximum d'infos utiles pour préparer l'envoi : adresse complète formatée,
-    personnalisation/variations par article, message du vendeur, nombre de jours
-    de traitement restants, etc.
-
-    Une ligne par ARTICLE (une commande avec plusieurs articles = plusieurs lignes,
-    mais regroupées via receipt_id pour pouvoir les recombiner si besoin).
-
-    Paramètres :
-    - limit : nombre max de commandes à récupérer (Etsy retourne par défaut les plus
-      anciennes non expédiées en premier si on trie par date de création croissante,
-      utile pour traiter les plus urgentes d'abord)
-    - include_thumbnails : mettre à False pour aller plus vite si tu n'as pas besoin
-      des images
-    """
-    shop_id = get_shop_id_for_user()
-
-    receipts_resp = requests.get(
-        f"{API_BASE}/shops/{shop_id}/receipts",
-        headers=get_headers(),
-        params={
-            "limit": limit,
-            "was_shipped": "false",
-            "was_paid": "true",
-            "sort_on": "created",
-            "sort_order": "asc",  # les plus anciennes (donc les plus urgentes) en premier
-        },
-    )
-    receipts_data = receipts_resp.json()
-
-    if receipts_resp.status_code != 200:
-        return {"step": "get_receipts", "status_code": receipts_resp.status_code, "data": receipts_data}
-
-    now = time.time()
-    rows = []
-
-    for receipt in receipts_data.get("results", []):
-        receipt_id = receipt.get("receipt_id")
-
-        # Adresse complète, déjà formatée par Etsy (prête à imprimer sur une étiquette)
-        formatted_address = receipt.get("formatted_address")
-
-        created_ts = receipt.get("created_timestamp")
-        days_since_order = round((now - created_ts) / 86400, 1) if created_ts else None
-
-        for t in receipt.get("transactions", []):
-            listing_id = t.get("listing_id")
-            listing_url = f"https://www.etsy.com/listing/{listing_id}" if listing_id else None
-
-            thumbnail_url = None
-            if include_thumbnails and listing_id:
-                thumbnail_url = get_listing_thumbnail(listing_id)
-
-            variations_text = " | ".join(
-                f"{v.get('formatted_name')}: {v.get('formatted_value')}"
-                for v in t.get("variations", [])
-            )
-
-            expected_ship_ts = t.get("expected_ship_date")
-            days_until_deadline = (
-                round((expected_ship_ts - now) / 86400, 1) if expected_ship_ts else None
-            )
-
-            row = {
-                # Identifiants
-                "receipt_id": receipt_id,
-                "transaction_id": t.get("transaction_id"),
-                "listing_id": listing_id,
-
-                # Acheteur / livraison
-                "buyer_name": receipt.get("name"),
-                "buyer_email": receipt.get("buyer_email"),
-                "formatted_address": formatted_address,  # adresse complète prête pour étiquette
-                "address_line1": receipt.get("first_line"),
-                "address_line2": receipt.get("second_line"),
-                "city": receipt.get("city"),
-                "state": receipt.get("state"),
-                "zip": receipt.get("zip"),
-                "country": receipt.get("country_iso"),
-
-                # Article + personnalisation
-                "title": t.get("title"),
-                "quantity": t.get("quantity"),
-                "variations": variations_text,
-                "sku": t.get("sku"),
-                "listing_url": listing_url,
-                "thumbnail_url": thumbnail_url,
-
-                # Cadeau
-                "is_gift": receipt.get("is_gift"),
-                "gift_message": receipt.get("gift_message"),
-
-                # Messages
-                "message_from_buyer": receipt.get("message_from_buyer"),
-                "message_from_seller": receipt.get("message_from_seller"),
-
-                # Financier
-                "price": t.get("price", {}).get("amount", 0) / t.get("price", {}).get("divisor", 100),
-                "currency": t.get("price", {}).get("currency_code"),
-                "grandtotal": receipt.get("grandtotal", {}).get("amount", 0)
-                / receipt.get("grandtotal", {}).get("divisor", 100),
-                "shipping_cost": receipt.get("total_shipping_cost", {}).get("amount", 0)
-                / receipt.get("total_shipping_cost", {}).get("divisor", 100),
-
-                # Statut / urgence
-                "status": receipt.get("status"),
-                "is_paid": receipt.get("is_paid"),
-                "is_shipped": receipt.get("is_shipped"),
-                "created_timestamp": created_ts,
-                "days_since_order": days_since_order,
-                "expected_ship_date": expected_ship_ts,
-                "days_until_ship_deadline": days_until_deadline,
-                "is_late": days_until_deadline is not None and days_until_deadline < 0,
-            }
-
-            rows.append(row)
-
-    return {
-        "shop_id": shop_id,
-        "count_receipts_to_ship": len(receipts_data.get("results", [])),
-        "count_rows": len(rows),
-        "rows": rows,
-    }
-
-
-@app.post("/ship/{receipt_id}")
-def mark_as_shipped(
-    receipt_id: int,
-    tracking_code: str,
-    carrier_name: str,
-    note_to_buyer: str = None,
-):
-    """
-    Marque une commande comme expédiée en envoyant le tracking et le transporteur
-    à Etsy (endpoint officiel createReceiptShipment).
-
-    ⚠️ Nécessite le scope OAuth 'transactions_w' (refais /authorize si ton token
-    actuel n'a que 'transactions_r').
-
-    Paramètres :
-    - receipt_id : l'identifiant de la commande (dans le path)
-    - tracking_code : numéro de suivi fourni par le transporteur (query param)
-    - carrier_name : nom du transporteur, doit matcher un nom reconnu par Etsy
-      (ex: "la-poste", "ups", "fedex", "dhl" ... voir /carriers pour la liste)
-    - note_to_buyer : message optionnel envoyé à l'acheteur
-
-    Exemple d'appel :
-    POST /ship/4093301320?tracking_code=1Z999AA10123456784&carrier_name=ups
-    """
-    shop_id = get_shop_id_for_user()
-
-    payload = {
-        "tracking_code": tracking_code,
-        "carrier_name": carrier_name,
-    }
-    if note_to_buyer:
-        payload["note_to_buyer"] = note_to_buyer
-
-    resp = requests.post(
-        f"{API_BASE}/shops/{shop_id}/receipts/{receipt_id}/tracking",
-        headers=get_headers(),
-        data=payload,
-    )
-
-    data = resp.json()
-
-    if resp.status_code != 200:
-        return {"success": False, "status_code": resp.status_code, "error": data}
-
-    return {
-        "success": True,
-        "message": f"✅ Commande #{receipt_id} marquée comme expédiée",
-        "raw": data,
-    }
-
-
-@app.get("/carriers")
-def list_carriers():
-    """
-    Liste les transporteurs reconnus par Etsy pour le tracking (utile pour savoir
-    quelle valeur exacte donner à carrier_name dans /ship).
-    """
-    resp = requests.get(f"{API_BASE}/shipping-carriers", headers=get_headers(), params={"origin_country_iso": "FR"})
-    return resp.json()
-
-
-@app.get("/receipt-status/{receipt_id}")
-def receipt_status(receipt_id: int):
-    """
-    Renvoie le statut d'expédition d'UNE commande précise (is_shipped, is_paid,
-    status). Utile pour vérifier rapidement, commande par commande, si elle a
-    déjà été expédiée avant de tenter un /ship dessus.
-    """
-    shop_id = get_shop_id_for_user()
-
-    resp = requests.get(
-        f"{API_BASE}/shops/{shop_id}/receipts/{receipt_id}",
-        headers=get_headers(),
-    )
-    data = resp.json()
-
-    if resp.status_code != 200:
-        return {"success": False, "status_code": resp.status_code, "error": data}
-
-    return {
-        "success": True,
-        "receipt_id": data.get("receipt_id"),
-        "is_paid": data.get("is_paid"),
-        "is_shipped": data.get("is_shipped"),
-        "status": data.get("status"),
-    }
-
-
-@app.get("/receipt/{receipt_id}")
-def receipt_details(receipt_id: int, include_thumbnails: bool = True):
-    """Renvoie une commande précise, qu'elle soit expédiée ou non."""
-    shop_id = get_shop_id_for_user()
-    resp = requests.get(
-        f"{API_BASE}/shops/{shop_id}/receipts/{receipt_id}",
-        headers=get_headers(),
-    )
-    receipt = resp.json()
-
-    if resp.status_code != 200:
-        detail = receipt.get("error") if isinstance(receipt, dict) else receipt
-        raise HTTPException(resp.status_code, detail or "Commande introuvable")
-
-    now = time.time()
+def receipt_to_rows(receipt, include_thumbnails=True, now=None):
+    """Return the stable superset consumed by every Orderify client."""
+    now = now or time.time()
     created_ts = receipt.get("created_timestamp")
     days_since_order = round((now - created_ts) / 86400, 1) if created_ts else None
     rows = []
-
     for transaction in receipt.get("transactions", []):
         listing_id = transaction.get("listing_id")
-        thumbnail_url = None
-        if include_thumbnails and listing_id:
-            thumbnail_url = get_listing_thumbnail(listing_id)
-
-        variations_text = " | ".join(
+        expected_ship_ts = transaction.get("expected_ship_date")
+        days_until_deadline = round((expected_ship_ts - now) / 86400, 1) if expected_ship_ts else None
+        variations = " | ".join(
             f"{variation.get('formatted_name')}: {variation.get('formatted_value')}"
             for variation in transaction.get("variations", [])
         )
-        expected_ship_ts = transaction.get("expected_ship_date")
-        days_until_deadline = (
-            round((expected_ship_ts - now) / 86400, 1) if expected_ship_ts else None
-        )
-
         rows.append({
             "receipt_id": receipt.get("receipt_id"),
             "transaction_id": transaction.get("transaction_id"),
@@ -698,21 +266,19 @@ def receipt_details(receipt_id: int, include_thumbnails: bool = True):
             "country": receipt.get("country_iso"),
             "title": transaction.get("title"),
             "quantity": transaction.get("quantity"),
-            "variations": variations_text,
+            "variations": variations,
             "sku": transaction.get("sku"),
             "listing_url": f"https://www.etsy.com/listing/{listing_id}" if listing_id else None,
-            "thumbnail_url": thumbnail_url,
+            "thumbnail_url": get_listing_thumbnail(listing_id) if include_thumbnails and listing_id else None,
             "is_gift": receipt.get("is_gift"),
             "gift_message": receipt.get("gift_message"),
             "message_from_buyer": receipt.get("message_from_buyer"),
             "message_from_seller": receipt.get("message_from_seller"),
-            "price": transaction.get("price", {}).get("amount", 0)
-            / transaction.get("price", {}).get("divisor", 100),
-            "currency": transaction.get("price", {}).get("currency_code"),
-            "grandtotal": receipt.get("grandtotal", {}).get("amount", 0)
-            / receipt.get("grandtotal", {}).get("divisor", 100),
-            "shipping_cost": receipt.get("total_shipping_cost", {}).get("amount", 0)
-            / receipt.get("total_shipping_cost", {}).get("divisor", 100),
+            "price": money_value(transaction.get("price")),
+            "currency": (transaction.get("price") or {}).get("currency_code"),
+            "grandtotal": money_value(receipt.get("grandtotal")),
+            "shipping_cost": money_value(receipt.get("total_shipping_cost")),
+            "discount": money_value(receipt.get("discount_amt")),
             "status": receipt.get("status"),
             "is_paid": receipt.get("is_paid"),
             "is_shipped": receipt.get("is_shipped"),
@@ -722,228 +288,275 @@ def receipt_details(receipt_id: int, include_thumbnails: bool = True):
             "days_until_ship_deadline": days_until_deadline,
             "is_late": days_until_deadline is not None and days_until_deadline < 0,
         })
+    return rows
 
+
+def get_receipts(*, limit, sort_order="desc", **filters):
+    shop_id = get_shop_id_for_user()
+    params = {"limit": limit, "sort_on": "created", "sort_order": sort_order, **filters}
+    response, data = etsy_request("GET", f"/shops/{shop_id}/receipts", params=params)
+    require_etsy_success(response, data, "Récupération des commandes")
+    return shop_id, data
+
+
+@app.get("/", response_class=FileResponse, include_in_schema=False)
+def home():
+    return FileResponse(INDEX_FILE)
+
+
+@app.get("/health", tags=["service"])
+def health():
     return {
-        "shop_id": shop_id,
-        "receipt_id": receipt.get("receipt_id"),
-        "count_rows": len(rows),
-        "rows": rows,
+        "status": "ok",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "uptime_seconds": round(time.time() - STARTED_AT),
+        "etsy_configured": bool(CLIENT_ID and CLIENT_SECRET and REDIRECT_URI),
+        "etsy_authorized": bool(STATE.get("access_token") or STATE.get("refresh_token")),
+        "api_key_configured": bool(API_KEY),
     }
 
-"""
-À AJOUTER À LA FIN de main_bakcend_render.py (sur Render), juste après la
-route /receipt-status/{receipt_id} existante.
 
-Cette route ne modifie AUCUNE route existante. Elle ajoute :
-
-GET /listings-stats?days=30        -> ventes sur les 30 derniers jours
-GET /listings-stats?days=90        -> ventes sur les 90 derniers jours
-GET /listings-stats?days=lifetime  -> ventes depuis toujours (par défaut)
-
-Pour CHAQUE listing actif de la boutique, renvoie :
-- les infos du listing (titre, description, tags, matériaux, prix, catégorie,
-  date de création/mise à jour, views lifetime, num_favorers)
-- les ventes calculées sur la période demandée (quantité vendue, revenu),
-  même si elles sont à 0 (listing jamais vendu inclus)
-
-⚠️ Limite connue de l'API Etsy : le champ "views" renvoyé par Etsy est un
-total LIFETIME, pas un total sur la période choisie. Il n'existe pas
-d'endpoint Etsy pour des vues "sur les 30 derniers jours" (voir doc Etsy /
-GitHub open-api discussions #1304 et #1386). Les ventes, elles, SONT
-calculées sur la période choisie car on les recompte nous-mêmes à partir
-des receipts.
-"""
-
-import time
-from datetime import datetime, timedelta
-
-import requests
-from fastapi import HTTPException
-
-# Ces noms (API_BASE, get_headers, get_shop_id_for_user) existent déjà dans
-# main_bakcend_render.py : ce fichier n'est PAS un module à importer, c'est
-# du texte à copier-coller à la suite du fichier existant.
+@app.get("/authorize", tags=["oauth"])
+def authorize():
+    if not CLIENT_ID or not REDIRECT_URI:
+        raise HTTPException(503, "ETSY_API_KEY ou REDIRECT_URI manque sur le serveur")
+    verifier, challenge = generate_pkce_pair()
+    oauth_state = secrets.token_urlsafe(24)
+    STATE.update({
+        "code_verifier": verifier,
+        "oauth_state": oauth_state,
+        "oauth_started_at": time.time(),
+    })
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "state": oauth_state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    query = "&".join(f"{key}={requests.utils.quote(str(value))}" for key, value in params.items())
+    return RedirectResponse(f"{AUTH_URL}?{query}")
 
 
-@app.get("/listings-stats")
+def oauth_result_page(title, message, success):
+    color = "#36d399" if success else "#fb7185"
+    return HTMLResponse(
+        f"""<!doctype html><html lang='fr'><meta charset='utf-8'><meta name='viewport' content='width=device-width'>
+        <title>{title} · Orderify</title><style>body{{margin:0;background:#0d1020;color:#f7f7fb;font:16px system-ui;display:grid;place-items:center;min-height:100vh}}
+        main{{max-width:620px;padding:42px;border:1px solid #2d3350;border-radius:24px;background:#15192c;box-shadow:0 24px 80px #0008}}h1{{color:{color}}}p{{line-height:1.6;color:#b8bfd7}}a{{color:#9c8cff}}</style>
+        <main><h1>{title}</h1><p>{message}</p><a href='/'>Retour à Orderify</a></main></html>""",
+        status_code=200 if success else 400,
+    )
+
+
+@app.get("/callback", tags=["oauth"])
+def callback(code: str = None, state: str = None, error: str = None, error_description: str = None):
+    if error:
+        return oauth_result_page("Autorisation refusée", error_description or error, False)
+    started_at = STATE.get("oauth_started_at") or 0
+    state_valid = state and STATE.get("oauth_state") and secrets.compare_digest(state, STATE["oauth_state"])
+    if not code or not STATE.get("code_verifier") or not state_valid or time.time() - started_at > 600:
+        return oauth_result_page("Autorisation invalide", "La session OAuth est absente, expirée ou ne correspond pas. Recommence depuis /authorize dans AdsPower.", False)
+
+    response = ETSY_SESSION.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code": code,
+            "code_verifier": STATE["code_verifier"],
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    data = _safe_json(response)
+    STATE.update({"code_verifier": None, "oauth_state": None, "oauth_started_at": None})
+    if response.status_code != 200:
+        return oauth_result_page("Connexion impossible", "Etsy n’a pas accepté l’autorisation. Recommence depuis /authorize.", False)
+    STATE["access_token"] = data.get("access_token")
+    STATE["refresh_token"] = data.get("refresh_token")
+    STATE["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+    STATE["shop_id"] = None
+    save_tokens_to_disk()
+    return oauth_result_page("Orderify est connecté", "L’autorisation Etsy est active. Tu peux fermer cette page et utiliser l’application locale.", True)
+
+
+@app.get("/status/config", tags=["service"], dependencies=PROTECTED)
+@app.get("/debug-env", include_in_schema=False, dependencies=PROTECTED)
+def config_status():
+    expires_in = round(STATE["expires_at"] - time.time()) if STATE.get("expires_at") else None
+    return {
+        "etsy_api_key_configured": bool(CLIENT_ID),
+        "etsy_secret_configured": bool(CLIENT_SECRET),
+        "redirect_uri_configured": bool(REDIRECT_URI),
+        "api_key_configured": bool(API_KEY),
+        "access_token_in_memory": bool(STATE.get("access_token")),
+        "refresh_token_available": bool(STATE.get("refresh_token")),
+        "token_expires_in_seconds": expires_in,
+    }
+
+
+@app.get("/admin/refresh-token", tags=["admin"], dependencies=PROTECTED)
+@app.get("/refresh-token", include_in_schema=False, dependencies=PROTECTED)
+def manual_refresh():
+    refresh_access_token()
+    return {"success": True, "message": "Autorisation Etsy renouvelée", "expires_at": STATE["expires_at"]}
+
+
+@app.get("/orders", tags=["orders"], dependencies=PROTECTED)
+@app.get("/test-orders", include_in_schema=False, dependencies=PROTECTED)
+def orders(limit: int = 10):
+    shop_id, data = get_receipts(limit=limit)
+    return {"shop_id": shop_id, "status_code": 200, "data": data}
+
+
+@app.get("/orders-full", tags=["orders"], dependencies=PROTECTED)
+def orders_full(limit: int = 10, include_thumbnails: bool = True):
+    shop_id, data = get_receipts(limit=limit)
+    rows = [row for receipt in data.get("results", []) for row in receipt_to_rows(receipt, include_thumbnails)]
+    return {"shop_id": shop_id, "count_receipts": len(data.get("results", [])), "count_rows": len(rows), "rows": rows}
+
+
+@app.get("/to-ship", tags=["orders"], dependencies=PROTECTED)
+def to_ship(limit: int = 50, include_thumbnails: bool = True):
+    shop_id, data = get_receipts(
+        limit=limit,
+        sort_order="asc",
+        was_shipped="false",
+        was_paid="true",
+    )
+    now = time.time()
+    rows = [row for receipt in data.get("results", []) for row in receipt_to_rows(receipt, include_thumbnails, now)]
+    return {"shop_id": shop_id, "count_receipts_to_ship": len(data.get("results", [])), "count_rows": len(rows), "rows": rows}
+
+
+@app.get("/receipt/{receipt_id}", tags=["orders"], dependencies=PROTECTED)
+def receipt_details(receipt_id: int, include_thumbnails: bool = True):
+    shop_id = get_shop_id_for_user()
+    response, receipt = etsy_request("GET", f"/shops/{shop_id}/receipts/{receipt_id}")
+    require_etsy_success(response, receipt, "Récupération de la commande")
+    rows = receipt_to_rows(receipt, include_thumbnails)
+    return {"shop_id": shop_id, "receipt_id": receipt.get("receipt_id"), "count_rows": len(rows), "rows": rows}
+
+
+@app.get("/receipt-status/{receipt_id}", tags=["orders"], dependencies=PROTECTED)
+def receipt_status(receipt_id: int):
+    shop_id = get_shop_id_for_user()
+    response, data = etsy_request("GET", f"/shops/{shop_id}/receipts/{receipt_id}")
+    if response.status_code != 200:
+        return {"success": False, "status_code": response.status_code, "error": data}
+    return {"success": True, "receipt_id": data.get("receipt_id"), "is_paid": data.get("is_paid"), "is_shipped": data.get("is_shipped"), "status": data.get("status")}
+
+
+@app.post("/ship/{receipt_id}", tags=["shipping"], dependencies=PROTECTED)
+def mark_as_shipped(receipt_id: int, tracking_code: str, carrier_name: str, note_to_buyer: str = None):
+    shop_id = get_shop_id_for_user()
+    payload = {"tracking_code": tracking_code, "carrier_name": carrier_name}
+    if note_to_buyer:
+        payload["note_to_buyer"] = note_to_buyer
+    response, data = etsy_request("POST", f"/shops/{shop_id}/receipts/{receipt_id}/tracking", data=payload)
+    if response.status_code != 200:
+        return {"success": False, "status_code": response.status_code, "error": data}
+    return {"success": True, "message": f"✅ Commande #{receipt_id} marquée comme expédiée", "raw": data}
+
+
+@app.get("/carriers", tags=["shipping"], dependencies=PROTECTED)
+def list_carriers():
+    response, data = etsy_request("GET", "/shipping-carriers", params={"origin_country_iso": "FR"})
+    require_etsy_success(response, data, "Récupération des transporteurs")
+    return data
+
+
+@app.get("/listings-stats", tags=["analytics"], dependencies=PROTECTED)
 def listings_stats(days: str = "lifetime"):
-    """
-    Récupère tous les listings ACTIFS de la boutique avec leurs infos
-    complètes + leurs ventes calculées sur la période choisie.
-
-    Paramètre :
-    - days : "30", "90" ou "lifetime" (défaut). Détermine la fenêtre sur
-      laquelle on additionne les ventes (quantité + revenu) par listing.
-      N'affecte PAS le champ "views" (toujours lifetime, limite Etsy).
-    """
     if days not in ("30", "90", "lifetime"):
         raise HTTPException(400, "Paramètre 'days' invalide : utilise 30, 90 ou lifetime")
-
     shop_id = get_shop_id_for_user()
 
-    # ------------------------------------------------------------------
-    # 1) Récupérer TOUS les listings actifs (pagination par lots de 100)
-    # ------------------------------------------------------------------
     all_listings = []
     offset = 0
     page_size = 100
-
     while True:
-        resp = requests.get(
-            f"{API_BASE}/shops/{shop_id}/listings",
-            headers=get_headers(),
-            params={
-                "state": "active",
-                "limit": page_size,
-                "offset": offset,
-                "includes": "images",  # tags est déjà un champ natif du listing, pas besoin de l'inclure
-            },
+        response, data = etsy_request(
+            "GET",
+            f"/shops/{shop_id}/listings",
+            params={"state": "active", "limit": page_size, "offset": offset, "includes": "images"},
         )
-        data = resp.json()
-
-        if resp.status_code != 200:
-            return {"step": "get_listings", "status_code": resp.status_code, "data": data}
-
+        require_etsy_success(response, data, "Récupération des listings")
         results = data.get("results", [])
         all_listings.extend(results)
-
         if len(results) < page_size:
-            break  # dernière page atteinte
+            break
         offset += page_size
 
-    # ------------------------------------------------------------------
-    # 2) Récupérer les receipts payés sur la période demandée, et agréger
-    #    les ventes (quantité + revenu) par listing_id
-    # ------------------------------------------------------------------
-    sales_by_listing = {}  # listing_id -> {"quantity": int, "revenue": float, "orders": int}
-
-    receipt_params = {
-        "limit": 100,
-        "was_paid": "true",
-        "sort_on": "created",
-        "sort_order": "desc",
-    }
-
+    sales_by_listing = {}
+    receipt_params = {"limit": 100, "was_paid": "true", "sort_on": "created", "sort_order": "desc"}
     if days != "lifetime":
-        cutoff_ts = int(time.time() - int(days) * 86400)
-        receipt_params["min_created"] = cutoff_ts
-
+        receipt_params["min_created"] = int(time.time() - int(days) * 86400)
     receipt_offset = 0
     while True:
         receipt_params["offset"] = receipt_offset
-        resp = requests.get(
-            f"{API_BASE}/shops/{shop_id}/receipts",
-            headers=get_headers(),
-            params=receipt_params,
-        )
-        data = resp.json()
-
-        if resp.status_code != 200:
-            return {"step": "get_receipts", "status_code": resp.status_code, "data": data}
-
+        response, data = etsy_request("GET", f"/shops/{shop_id}/receipts", params=receipt_params)
+        require_etsy_success(response, data, "Récupération des ventes")
         results = data.get("results", [])
-
         for receipt in results:
-            for t in receipt.get("transactions", []):
-                listing_id = t.get("listing_id")
+            for transaction in receipt.get("transactions", []):
+                listing_id = transaction.get("listing_id")
                 if listing_id is None:
                     continue
-
-                qty = t.get("quantity", 0) or 0
-                price = t.get("price", {}) or {}
-                revenue = (price.get("amount", 0) or 0) / (price.get("divisor", 100) or 100) * qty
-
-                if listing_id not in sales_by_listing:
-                    sales_by_listing[listing_id] = {"quantity": 0, "revenue": 0.0, "orders": 0}
-
-                sales_by_listing[listing_id]["quantity"] += qty
-                sales_by_listing[listing_id]["revenue"] += revenue
-                sales_by_listing[listing_id]["orders"] += 1
-
-        if len(results) < receipt_params["limit"]:
+                quantity = transaction.get("quantity", 0) or 0
+                sales = sales_by_listing.setdefault(listing_id, {"quantity": 0, "revenue": 0.0, "orders": 0})
+                sales["quantity"] += quantity
+                sales["revenue"] += money_value(transaction.get("price")) * quantity
+                sales["orders"] += 1
+        if len(results) < receipt_params["limit"] or receipt_offset >= 4900:
             break
         receipt_offset += receipt_params["limit"]
 
-        # Filet de sécurité : au-delà de 5000 receipts scannés, on arrête
-        # pour éviter une boucle trop longue sur une vieille boutique.
-        if receipt_offset >= 5000:
-            break
-
-    # ------------------------------------------------------------------
-    # 3) Construire la liste finale : un objet complet par listing
-    # ------------------------------------------------------------------
     rows = []
-
     for listing in all_listings:
         listing_id = listing.get("listing_id")
-
-        tags = listing.get("tags") or []
-        materials = listing.get("materials") or []
-
         images = listing.get("images") or []
-        thumbnail_url = None
-        if images:
-            first_image = images[0]
-            thumbnail_url = (
-                first_image.get("url_fullxfull")
-                or first_image.get("url_570xN")
-                or first_image.get("url_170x135")
-            )
-
+        first_image = images[0] if images else {}
         price_info = listing.get("price") or {}
-        price = (price_info.get("amount", 0) or 0) / (price_info.get("divisor", 100) or 100)
-
         created_ts = listing.get("original_creation_timestamp")
         updated_ts = listing.get("last_modified_timestamp")
-
         sales = sales_by_listing.get(listing_id, {"quantity": 0, "revenue": 0.0, "orders": 0})
-
         rows.append({
-            # Identifiants
             "listing_id": listing_id,
             "listing_url": listing.get("url") or (f"https://www.etsy.com/listing/{listing_id}" if listing_id else None),
-
-            # Contenu (le plus utile pour analyser "pourquoi ça marche")
             "title": listing.get("title"),
             "description": listing.get("description"),
-            "tags": tags,
-            "materials": materials,
+            "tags": listing.get("tags") or [],
+            "materials": listing.get("materials") or [],
             "category_path": listing.get("taxonomy_id"),
-            "thumbnail_url": thumbnail_url,
-
-            # Prix / offre
-            "price": price,
+            "thumbnail_url": first_image.get("url_fullxfull") or first_image.get("url_570xN") or first_image.get("url_170x135"),
+            "price": money_value(price_info),
             "currency": price_info.get("currency_code"),
             "quantity_available": listing.get("quantity"),
             "who_made": listing.get("who_made"),
             "when_made": listing.get("when_made"),
             "is_customizable": listing.get("is_customizable"),
             "is_personalizable": listing.get("is_personalizable"),
-
-            # Stats natives Etsy (LIFETIME, limite connue de l'API)
             "views_lifetime": listing.get("views"),
             "num_favorers": listing.get("num_favorers"),
-
-            # Ventes calculées par nous (sur la période demandée)
             "sales_quantity": sales["quantity"],
             "sales_revenue": round(sales["revenue"], 2),
             "sales_orders_count": sales["orders"],
             "sales_period_days": days,
-
-            # Dates
             "created_timestamp": created_ts,
             "created_date": datetime.fromtimestamp(created_ts).strftime("%Y-%m-%d") if created_ts else None,
             "last_modified_timestamp": updated_ts,
             "last_modified_date": datetime.fromtimestamp(updated_ts).strftime("%Y-%m-%d") if updated_ts else None,
-
             "state": listing.get("state"),
         })
-
     return {
         "shop_id": shop_id,
         "sales_period_days": days,
         "count_listings": len(rows),
-        "note": "views_lifetime est un total depuis toujours (limite API Etsy, pas de vues par période). "
-                "sales_quantity / sales_revenue / sales_orders_count sont calculés sur la période demandée.",
+        "note": "views_lifetime est un total depuis toujours. Les ventes sont calculées sur la période demandée.",
         "rows": rows,
     }
