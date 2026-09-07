@@ -257,6 +257,11 @@ def receipt_to_rows(receipt, include_thumbnails=True, now=None):
             "listing_id": listing_id,
             "buyer_name": receipt.get("name"),
             "buyer_email": receipt.get("buyer_email"),
+            "buyer_phone": (
+                receipt.get("buyer_phone")
+                or receipt.get("recipient_phone")
+                or receipt.get("phone")
+            ),
             "formatted_address": receipt.get("formatted_address"),
             "address_line1": receipt.get("first_line"),
             "address_line2": receipt.get("second_line"),
@@ -268,6 +273,7 @@ def receipt_to_rows(receipt, include_thumbnails=True, now=None):
             "quantity": transaction.get("quantity"),
             "variations": variations,
             "sku": transaction.get("sku"),
+            "personalization": transaction.get("personalization") or "",
             "listing_url": f"https://www.etsy.com/listing/{listing_id}" if listing_id else None,
             "thumbnail_url": get_listing_thumbnail(listing_id) if include_thumbnails and listing_id else None,
             "is_gift": receipt.get("is_gift"),
