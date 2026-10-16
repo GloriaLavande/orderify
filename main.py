@@ -7,6 +7,7 @@ import os
 import secrets
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -60,6 +61,8 @@ STATE = {
 }
 _TOKEN_LOCK = threading.RLock()
 _THUMBNAIL_CACHE = {}
+_INVENTORY_CACHE = {}
+_INVENTORY_CACHE_SECONDS = 300
 
 
 def _build_etsy_session():
@@ -232,6 +235,83 @@ def get_listing_thumbnail(listing_id):
     return url
 
 
+def _normalized_variation_value(value):
+    decomposed = unicodedata.normalize("NFKD", str(value or "").casefold())
+    return "".join(character for character in decomposed if character.isalnum())
+
+
+def get_listing_inventory_products(listing_id):
+    """Lit l'inventaire actuel uniquement côté backend Render, avec cache court."""
+    cached = _INVENTORY_CACHE.get(listing_id)
+    now = time.time()
+    if cached and now - cached[0] < _INVENTORY_CACHE_SECONDS:
+        return cached[1]
+    response, data = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    products = data.get("products", []) if response.status_code == 200 else []
+    _INVENTORY_CACHE[listing_id] = (now, products)
+    return products
+
+
+def get_listing_inventory_sku(listing_id, variations):
+    """Retrouve le SKU courant quand l'instantané historique Etsy n'en avait pas."""
+    if not listing_id:
+        return None
+    products = get_listing_inventory_products(listing_id)
+    selected_by_id = {
+        str(variation.get("property_id")): str(variation.get("value_id"))
+        for variation in (variations or [])
+        if variation.get("property_id") is not None
+        and variation.get("value_id") is not None
+    }
+    selected_by_name = {
+        _normalized_variation_value(variation.get("formatted_name")):
+        _normalized_variation_value(variation.get("formatted_value"))
+        for variation in (variations or [])
+        if variation.get("formatted_name") and variation.get("formatted_value")
+    }
+
+    matches = []
+    all_skus = set()
+    for product in products:
+        sku = str(product.get("sku") or "").strip()
+        if not sku:
+            continue
+        all_skus.add(sku)
+        comparable = 0
+        mismatch = False
+        for value in product.get("property_values", []):
+            property_id = value.get("property_id")
+            property_name = _normalized_variation_value(value.get("property_name"))
+            expected_id = selected_by_id.get(str(property_id))
+            expected_value = selected_by_name.get(property_name)
+            if expected_id is not None:
+                comparable += 1
+                value_ids = {str(item) for item in value.get("value_ids", [])}
+                if expected_id not in value_ids:
+                    mismatch = True
+                    break
+            elif expected_value:
+                comparable += 1
+                values = {
+                    _normalized_variation_value(item)
+                    for item in value.get("values", [])
+                }
+                if expected_value not in values:
+                    mismatch = True
+                    break
+        if not mismatch and comparable:
+            matches.append((comparable, sku))
+
+    if matches:
+        best_score = max(score for score, _ in matches)
+        best_skus = {sku for score, sku in matches if score == best_score}
+        if len(best_skus) == 1:
+            return best_skus.pop()
+    if len(all_skus) == 1:
+        return all_skus.pop()
+    return None
+
+
 def money_value(value):
     value = value or {}
     return (value.get("amount", 0) or 0) / (value.get("divisor", 100) or 100)
@@ -245,6 +325,13 @@ def receipt_to_rows(receipt, include_thumbnails=True, now=None):
     rows = []
     for transaction in receipt.get("transactions", []):
         listing_id = transaction.get("listing_id")
+        transaction_sku = str(transaction.get("sku") or "").strip()
+        inventory_sku = None
+        if not transaction_sku and listing_id:
+            inventory_sku = get_listing_inventory_sku(
+                listing_id,
+                transaction.get("variations", []),
+            )
         expected_ship_ts = transaction.get("expected_ship_date")
         days_until_deadline = round((expected_ship_ts - now) / 86400, 1) if expected_ship_ts else None
         variations = " | ".join(
@@ -272,7 +359,11 @@ def receipt_to_rows(receipt, include_thumbnails=True, now=None):
             "title": transaction.get("title"),
             "quantity": transaction.get("quantity"),
             "variations": variations,
-            "sku": transaction.get("sku"),
+            "sku": transaction_sku or inventory_sku,
+            "sku_source": (
+                "transaction" if transaction_sku
+                else ("listing_inventory" if inventory_sku else None)
+            ),
             "personalization": transaction.get("personalization") or "",
             "listing_url": f"https://www.etsy.com/listing/{listing_id}" if listing_id else None,
             "thumbnail_url": get_listing_thumbnail(listing_id) if include_thumbnails and listing_id else None,

@@ -9,7 +9,7 @@ ETSY_API_KEY=...
 ETSY_SECRET=...
 ETSY_REFRESH_TOKEN=...
 REDIRECT_URI=https://orderify-d26d.onrender.com/callback
-ORDERIFY_API_KEY=UNE_CLE_FORTE_PARTAGEE_AVEC_LES_CLIENTS_LOCAUX
+# Facultatif : ORDERIFY_API_KEY=UNE_CLE_FORTE_PARTAGEE_AVEC_LES_CLIENTS_LOCAUX
 ```
 
 ## Démarrage
@@ -21,7 +21,7 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 ## Sécurité
 
 - `/`, `/health`, `/authorize` et `/callback` sont publics.
-- Les routes contenant des données ou des actions exigent `X-Orderify-Key`.
+- Lorsque `ORDERIFY_API_KEY` est configurée, les routes de données exigent `X-Orderify-Key`. Sans cette variable, le mode personnel compatible reste accessible.
 - Le backend contacte Etsy depuis Render; les applications locales ne doivent jamais contacter Etsy directement.
 - Les fichiers `.env` et `tokens.json` ne doivent jamais être ajoutés à Git.
 
