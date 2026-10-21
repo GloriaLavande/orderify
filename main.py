@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -328,8 +328,15 @@ def _decimal_price(value):
     return Decimal(str(value))
 
 
-def _clean_inventory_payload(inventory, adjustment):
+def _is_no_strap_variant(variant):
+    """Repère les options Etsy dont une valeur de variation contient « No strap »."""
+    return "no strap" in " ".join(str(variant or "").lower().split())
+
+
+def _clean_inventory_payload(inventory, adjustment, no_strap_policy="full"):
     """Reconstruit le payload complet accepté par updateListingInventory."""
+    if no_strap_policy not in {"full", "exclude", "half"}:
+        raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
     products = []
     changes = []
     for product_index, source_product in enumerate(inventory.get("products") or []):
@@ -351,10 +358,20 @@ def _clean_inventory_payload(inventory, adjustment):
             for item in product["property_values"]
             if item.get("values")
         ) or product["sku"] or f"Option {product_index + 1}"
+        is_no_strap = _is_no_strap_variant(variant)
+        applied_adjustment = adjustment
+        if is_no_strap and no_strap_policy == "exclude":
+            applied_adjustment = Decimal("0")
+        elif is_no_strap and no_strap_policy == "half":
+            applied_adjustment = (adjustment / Decimal("2")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
 
         for offering_index, source_offering in enumerate(source_product.get("offerings") or []):
             old_price = _decimal_price(source_offering.get("price"))
-            new_price = (old_price + adjustment).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            new_price = (old_price + applied_adjustment).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
             if old_price <= 0 or new_price <= 0:
                 raise HTTPException(422, f"Prix invalide pour {variant}: {new_price}")
             offering = {
@@ -371,6 +388,8 @@ def _clean_inventory_payload(inventory, adjustment):
                 "sku": product["sku"],
                 "variant": variant,
                 "enabled": offering["is_enabled"],
+                "is_no_strap": is_no_strap,
+                "applied_adjustment": float(applied_adjustment),
                 "old_price": float(old_price.quantize(Decimal("0.01"))),
                 "new_price": float(new_price),
             })
@@ -391,7 +410,7 @@ def _clean_inventory_payload(inventory, adjustment):
     return payload, changes
 
 
-def listing_price_adjustment(listing_id, amount, apply=False):
+def listing_price_adjustment(listing_id, amount, apply=False, no_strap_policy="full"):
     """Prévisualise ou applique un montant fixe à chaque offering d'un listing."""
     try:
         adjustment = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -399,6 +418,8 @@ def listing_price_adjustment(listing_id, amount, apply=False):
         raise HTTPException(422, "Montant invalide") from exc
     if adjustment == 0 or abs(adjustment) > Decimal("1000"):
         raise HTTPException(422, "Le montant doit être non nul et compris entre -1000 et 1000")
+    if no_strap_policy not in {"full", "exclude", "half"}:
+        raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
 
     shop_id = get_shop_id_for_user()
     listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
@@ -409,7 +430,7 @@ def listing_price_adjustment(listing_id, amount, apply=False):
     inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
     require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
     backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
-    payload, changes = _clean_inventory_payload(inventory, adjustment)
+    payload, changes = _clean_inventory_payload(inventory, adjustment, no_strap_policy)
     currency = next(
         (
             offering.get("price", {}).get("currency_code")
@@ -428,7 +449,10 @@ def listing_price_adjustment(listing_id, amount, apply=False):
         "state": listing.get("state"),
         "currency": currency,
         "adjustment": float(adjustment),
+        "no_strap_policy": no_strap_policy,
         "count_prices": len(changes),
+        "count_changed": sum(change["old_price"] != change["new_price"] for change in changes),
+        "count_no_strap": sum(change["is_no_strap"] for change in changes),
         "count_enabled": sum(1 for change in changes if change["enabled"]),
         "changes": changes,
         "backup_payload": backup_payload,
@@ -706,9 +730,14 @@ def list_carriers():
 
 
 @app.post("/listing-prices/{listing_id}/adjust", tags=["pricing"], dependencies=PROTECTED)
-def adjust_listing_prices(listing_id: int, amount: float, apply: bool = False):
+def adjust_listing_prices(
+    listing_id: int,
+    amount: float,
+    apply: bool = False,
+    no_strap_policy: str = "full",
+):
     """Ajoute un montant fixe à toutes les options, avec aperçu par défaut."""
-    return listing_price_adjustment(listing_id, amount, apply)
+    return listing_price_adjustment(listing_id, amount, apply, no_strap_policy)
 
 
 @app.get("/listings-stats", tags=["analytics"], dependencies=PROTECTED)
