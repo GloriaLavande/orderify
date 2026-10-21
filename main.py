@@ -9,6 +9,7 @@ import threading
 import time
 import unicodedata
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 import requests
@@ -19,7 +20,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -28,7 +29,7 @@ REDIRECT_URI = os.getenv("REDIRECT_URI")
 API_KEY = os.getenv("ORDERIFY_API_KEY")
 ENV_REFRESH_TOKEN = os.getenv("ETSY_REFRESH_TOKEN")
 
-SCOPES = "transactions_r transactions_w shops_r listings_r"
+SCOPES = "transactions_r transactions_w shops_r listings_r listings_w"
 AUTH_URL = "https://www.etsy.com/oauth/connect"
 TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 API_BASE = "https://openapi.etsy.com/v3/application"
@@ -46,6 +47,7 @@ app = FastAPI(
         {"name": "orders", "description": "Commandes et articles Etsy."},
         {"name": "shipping", "description": "Suivi et transporteurs."},
         {"name": "analytics", "description": "Données et statistiques des listings."},
+        {"name": "pricing", "description": "Aperçu et modification sécurisée des prix."},
         {"name": "admin", "description": "Actions administratives protégées."},
     ],
 )
@@ -183,18 +185,19 @@ def get_headers():
     }
 
 
-def etsy_request(method, path, *, params=None, data=None, authenticated=True):
+def etsy_request(method, path, *, params=None, data=None, json_data=None, authenticated=True):
     url = path if path.startswith("http") else f"{API_BASE}{path}"
     headers = get_headers() if authenticated else None
     try:
-        response = ETSY_SESSION.request(
-            method,
-            url,
-            headers=headers,
-            params=params,
-            data=data,
-            timeout=REQUEST_TIMEOUT,
-        )
+        request_kwargs = {
+            "headers": headers,
+            "params": params,
+            "data": data,
+            "timeout": REQUEST_TIMEOUT,
+        }
+        if json_data is not None:
+            request_kwargs["json"] = json_data
+        response = ETSY_SESSION.request(method, url, **request_kwargs)
     except requests.RequestException as exc:
         raise HTTPException(502, f"Etsy est momentanément inaccessible: {exc}") from exc
     return response, _safe_json(response)
@@ -315,6 +318,141 @@ def get_listing_inventory_sku(listing_id, variations):
 def money_value(value):
     value = value or {}
     return (value.get("amount", 0) or 0) / (value.get("divisor", 100) or 100)
+
+
+def _decimal_price(value):
+    """Convertit un prix Etsy (Money ou nombre) en Decimal sans erreur de float."""
+    if isinstance(value, dict):
+        divisor = Decimal(str(value.get("divisor") or 100))
+        return Decimal(str(value.get("amount") or 0)) / divisor
+    return Decimal(str(value))
+
+
+def _clean_inventory_payload(inventory, adjustment):
+    """Reconstruit le payload complet accepté par updateListingInventory."""
+    products = []
+    changes = []
+    for product_index, source_product in enumerate(inventory.get("products") or []):
+        product = {
+            "sku": source_product.get("sku") or "",
+            "property_values": [],
+            "offerings": [],
+        }
+        for source_property in source_product.get("property_values") or []:
+            property_value = {
+                key: source_property[key]
+                for key in ("property_id", "property_name", "scale_id", "value_ids", "values")
+                if source_property.get(key) is not None
+            }
+            product["property_values"].append(property_value)
+
+        variant = " · ".join(
+            "/".join(str(value) for value in (item.get("values") or []))
+            for item in product["property_values"]
+            if item.get("values")
+        ) or product["sku"] or f"Option {product_index + 1}"
+
+        for offering_index, source_offering in enumerate(source_product.get("offerings") or []):
+            old_price = _decimal_price(source_offering.get("price"))
+            new_price = (old_price + adjustment).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if old_price <= 0 or new_price <= 0:
+                raise HTTPException(422, f"Prix invalide pour {variant}: {new_price}")
+            offering = {
+                "price": float(new_price),
+                "quantity": source_offering.get("quantity", 0),
+                "is_enabled": bool(source_offering.get("is_enabled", True)),
+            }
+            if source_offering.get("readiness_state_id") is not None:
+                offering["readiness_state_id"] = source_offering["readiness_state_id"]
+            product["offerings"].append(offering)
+            changes.append({
+                "product_index": product_index,
+                "offering_index": offering_index,
+                "sku": product["sku"],
+                "variant": variant,
+                "enabled": offering["is_enabled"],
+                "old_price": float(old_price.quantize(Decimal("0.01"))),
+                "new_price": float(new_price),
+            })
+        products.append(product)
+
+    if not changes:
+        raise HTTPException(422, "Ce listing ne contient aucune option tarifaire modifiable")
+
+    payload = {"products": products}
+    for key in (
+        "price_on_property",
+        "quantity_on_property",
+        "sku_on_property",
+        "readiness_state_on_property",
+    ):
+        if inventory.get(key) is not None:
+            payload[key] = inventory[key]
+    return payload, changes
+
+
+def listing_price_adjustment(listing_id, amount, apply=False):
+    """Prévisualise ou applique un montant fixe à chaque offering d'un listing."""
+    try:
+        adjustment = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Montant invalide") from exc
+    if adjustment == 0 or abs(adjustment) > Decimal("1000"):
+        raise HTTPException(422, "Le montant doit être non nul et compris entre -1000 et 1000")
+
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    payload, changes = _clean_inventory_payload(inventory, adjustment)
+    currency = next(
+        (
+            offering.get("price", {}).get("currency_code")
+            for product in inventory.get("products") or []
+            for offering in product.get("offerings") or []
+            if isinstance(offering.get("price"), dict)
+            and offering.get("price", {}).get("currency_code")
+        ),
+        None,
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": currency,
+        "adjustment": float(adjustment),
+        "count_prices": len(changes),
+        "count_enabled": sum(1 for change in changes if change["enabled"]),
+        "changes": changes,
+        "backup_payload": backup_payload,
+    }
+    if not apply:
+        return result
+
+    update_response, update_data = etsy_request(
+        "PUT",
+        f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"},
+        json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Mise à jour des prix")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(verify_response, verified_inventory, "Vérification des nouveaux prix")
+    _, verified_changes = _clean_inventory_payload(verified_inventory, Decimal("0"))
+    actual_prices = [change["old_price"] for change in verified_changes]
+    expected_prices = [change["new_price"] for change in changes]
+    if actual_prices != expected_prices:
+        raise HTTPException(502, "Etsy a répondu, mais la vérification des prix ne correspond pas")
+    result.update({"applied": True, "verified": True})
+    return result
 
 
 def receipt_to_rows(receipt, include_thumbnails=True, now=None):
@@ -565,6 +703,12 @@ def list_carriers():
     response, data = etsy_request("GET", "/shipping-carriers", params={"origin_country_iso": "FR"})
     require_etsy_success(response, data, "Récupération des transporteurs")
     return data
+
+
+@app.post("/listing-prices/{listing_id}/adjust", tags=["pricing"], dependencies=PROTECTED)
+def adjust_listing_prices(listing_id: int, amount: float, apply: bool = False):
+    """Ajoute un montant fixe à toutes les options, avec aperçu par défaut."""
+    return listing_price_adjustment(listing_id, amount, apply)
 
 
 @app.get("/listings-stats", tags=["analytics"], dependencies=PROTECTED)
