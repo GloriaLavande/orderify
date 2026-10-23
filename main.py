@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -392,6 +392,189 @@ def _kindle_discounted_target(rule, current_discounted_price):
     return None
 
 
+def _parse_delivered_targets(raw_config):
+    """Valide la politique locale transmise au backend pour les totaux livrés."""
+    if not raw_config:
+        raise HTTPException(422, "Configuration des prix livrés manquante")
+    try:
+        config = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Configuration des prix livrés invalide") from exc
+    targets = config.get("delivered_targets_eur") or config.get("targets")
+    required = {
+        "No strap", "Clear Back No Strap", "Built-in Hand Strap",
+        "ClearBack Hand Strap", "Rotate&Detach sans sangle - standard",
+    }
+    if not isinstance(targets, dict) or not required.issubset(targets):
+        raise HTTPException(422, "La configuration ne contient pas toutes les cibles livrées")
+    try:
+        normalized_targets = {
+            key: Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            for key, value in targets.items()
+        }
+        no_strap_cap = Decimal(str(config.get(
+            "no_strap_discounted_item_cap_eur", "14.33"
+        ))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        no_strap_max_increase = Decimal(str(config.get(
+            "no_strap_maximum_discounted_increase_from_saved_baseline_eur", "1.00"
+        ))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Montant invalide dans la configuration des prix livrés") from exc
+    if any(value <= 0 for value in normalized_targets.values()):
+        raise HTTPException(422, "Les cibles livrées doivent être positives")
+    if no_strap_cap <= 0 or no_strap_max_increase < 0:
+        raise HTTPException(422, "Plafond No strap invalide")
+    return {
+        "market": str(config.get("market") or "FR").upper(),
+        "currency": str(config.get("currency") or "EUR").upper(),
+        "quantity": int(config.get("quantity") or 1),
+        "shipping_service": str(config.get("shipping_service") or "standard"),
+        "allow_price_decreases": bool(config.get("allow_price_decreases", False)),
+        "targets": normalized_targets,
+        "no_strap_cap": no_strap_cap,
+        "no_strap_max_increase": no_strap_max_increase,
+        "rotate_low_patterns": [
+            _normalized_variant_name(item)
+            for item in (config.get("rotate_detach_low_model_patterns") or [])
+            if str(item).strip()
+        ],
+        "review_model_keywords": [
+            _normalized_variant_name(item)
+            for item in (config.get("review_model_keywords") or ["scribe", "oasis", "kobo", "fire"])
+            if str(item).strip()
+        ],
+    }
+
+
+def _parse_discounted_baselines(raw_baselines):
+    if not raw_baselines:
+        return {}
+    try:
+        values = json.loads(raw_baselines) if isinstance(raw_baselines, str) else dict(raw_baselines)
+        return {
+            str(key): Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            for key, value in values.items()
+        }
+    except (TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Références No strap invalides") from exc
+
+
+def _product_model_style(property_values, sku=""):
+    """Extrait modèle et style sans dépendre de la position des propriétés Etsy."""
+    model_values, style_values, other_values = [], [], []
+    for item in property_values or []:
+        values = [str(value) for value in (item.get("values") or []) if str(value).strip()]
+        name = _normalized_variant_name(item.get("property_name") or "")
+        if any(token in name for token in ("model", "device", "kindle", "kobo", "reader")):
+            model_values.extend(values)
+        elif any(token in name for token in ("style", "case", "cover", "strap")):
+            style_values.extend(values)
+        else:
+            other_values.extend(values)
+    all_values = model_values + style_values + other_values
+    if not style_values:
+        style_values = [
+            value for value in all_values
+            if any(token in _normalized_variant_name(value) for token in (
+                "strap", "clear back", "clearback", "rotate", "detach", "magnetic"
+            ))
+        ]
+    if not model_values:
+        style_set = set(style_values)
+        model_values = [value for value in all_values if value not in style_set]
+    return (
+        " / ".join(model_values) or str(sku or "Modèle inconnu"),
+        " / ".join(style_values) or "Style inconnu",
+    )
+
+
+def _stable_baseline_key(product, offering_index):
+    """Identité stable d'une offre, indépendante de l'ordre des produits Etsy."""
+    identity = {
+        "sku": product.get("sku") or "",
+        "property_values": [{
+            "property_id": item.get("property_id"),
+            "value_ids": item.get("value_ids") or [],
+            "values": item.get("values") or [],
+        } for item in product.get("property_values") or []],
+        "offering_index": offering_index,
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"{product.get('sku') or 'sans-sku'}:{digest}"
+
+
+def _delivered_pricing_rule(model, style, config):
+    """Classe uniquement des constructions certaines; aucune proximité de prix."""
+    normalized_model = _normalized_variant_name(model)
+    normalized_style = _normalized_variant_name(style)
+    combined = f"{normalized_model} {normalized_style}".strip()
+    special = next(
+        (keyword for keyword in config["review_model_keywords"] if keyword in normalized_model),
+        None,
+    )
+    if special:
+        return None, f"modèle particulier à vérifier ({special})"
+    if "clear back no strap" in combined or "clearback no strap" in combined:
+        return "Clear Back No Strap", None
+    if "build in hand strap" in combined or "built in hand strap" in combined:
+        return "Built-in Hand Strap", None
+    if "clearback hand strap" in combined or "clear back hand strap" in combined:
+        return "ClearBack Hand Strap", None
+    if "rotate detach" in combined:
+        plain_without_strap = normalized_style in {"rotate detach", "rotate and detach"}
+        has_no_strap = "no strap" in combined or "sans sangle" in combined or plain_without_strap
+        has_strap = "strap" in combined or "sangle" in combined
+        if not has_no_strap:
+            detail = "détachable avec sangle" if has_strap else "type de sangle inconnu"
+            return None, f"{detail} : cible automatique interdite"
+        if any(pattern in normalized_model for pattern in config["rotate_low_patterns"]):
+            if "Rotate&Detach sans sangle - bas" not in config["targets"]:
+                return None, "cible du niveau bas absente"
+            return "Rotate&Detach sans sangle - bas", None
+        return "Rotate&Detach sans sangle - standard", None
+    if "side magnetic" in combined or "magnetic back" in combined:
+        return None, "construction magnétique distincte à vérifier"
+    if "no strap" in combined or "sans sangle" in combined:
+        return "No strap", None
+    return None, "variante inconnue"
+
+
+def _get_listing_shipping_profile(listing_id):
+    response, data = etsy_request(
+        "GET", "/listings/batch/shipping", params={"listing_ids": str(listing_id)}
+    )
+    require_etsy_success(response, data, "Récupération du profil de livraison")
+    for item in data.get("results") or []:
+        if int(item.get("listing_id") or 0) == int(listing_id):
+            return item.get("shipping_profile")
+    return None
+
+
+def _fr_primary_shipping(profile, currency="EUR"):
+    """Retourne le port principal FR d'un profil manuel, jamais le coût additionnel."""
+    if not isinstance(profile, dict):
+        return None, None, "profil de livraison inconnu"
+    if str(profile.get("profile_type") or "manual").lower() != "manual":
+        return None, None, "livraison calculée : devis France requis"
+    for destination in profile.get("shipping_profile_destinations") or []:
+        if str(destination.get("destination_country_iso") or "").upper() != "FR":
+            continue
+        money = destination.get("primary_cost")
+        if not isinstance(money, dict) or money.get("amount") is None:
+            return None, None, "coût principal France inconnu"
+        money_currency = str(money.get("currency_code") or currency).upper()
+        if money_currency != str(currency).upper():
+            return None, None, f"devise du port inattendue ({money_currency})"
+        divisor = Decimal(str(money.get("divisor") or 100))
+        cost = (Decimal(str(money.get("amount"))) / divisor).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        return cost, "profil Etsy · destination FR · primary_cost", None
+    return None, None, "destination France absente du profil"
+
+
 def _base_price_for_discounted_target(target, multiplier):
     """Trouve un prix Etsy au centime donnant exactement la cible après remise."""
     approximate = (target / multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -413,11 +596,12 @@ def _clean_inventory_payload(
     no_strap_policy="full",
     pricing_profile="fixed",
     sale_discount_percent=40,
+    delivered_context=None,
 ):
     """Reconstruit le payload complet accepté par updateListingInventory."""
     if no_strap_policy not in {"full", "exclude", "half"}:
         raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
-    if pricing_profile not in {"fixed", "kindle_sale_targets"}:
+    if pricing_profile not in {"fixed", "kindle_sale_targets", "delivered_targets"}:
         raise HTTPException(422, "Profil de prix invalide")
     try:
         discount = Decimal(str(sale_discount_percent))
@@ -426,6 +610,15 @@ def _clean_inventory_payload(
     if discount < 0 or discount >= 100:
         raise HTTPException(422, "La promotion doit être comprise entre 0 et 99,99 %")
     multiplier = (Decimal("100") - discount) / Decimal("100")
+    delivered_context = delivered_context or {}
+    delivered_config = delivered_context.get("config")
+    shipping_cost = delivered_context.get("shipping_cost")
+    shipping_source = delivered_context.get("shipping_source")
+    shipping_error = delivered_context.get("shipping_error")
+    baselines = delivered_context.get("baselines") or {}
+    promotion_source = delivered_context.get("promotion_source") or "non renseignée"
+    if pricing_profile == "delivered_targets" and delivered_config is None:
+        raise HTTPException(422, "Contexte des prix livrés manquant")
     products = []
     changes = []
     for product_index, source_product in enumerate(inventory.get("products") or []):
@@ -447,6 +640,7 @@ def _clean_inventory_payload(
             for item in product["property_values"]
             if item.get("values")
         ) or product["sku"] or f"Option {product_index + 1}"
+        model, style = _product_model_style(product["property_values"], product["sku"])
         is_no_strap = _is_no_strap_variant(variant)
         applied_adjustment = adjustment
         pricing_rule = "Montant fixe"
@@ -460,12 +654,23 @@ def _clean_inventory_payload(
         if pricing_profile == "kindle_sale_targets":
             pricing_rule = _kindle_pricing_rule(variant) or "Non reconnue"
             matched = pricing_rule != "Non reconnue"
+        elif pricing_profile == "delivered_targets":
+            pricing_rule, match_error = _delivered_pricing_rule(model, style, delivered_config)
+            matched = pricing_rule is not None
 
         for offering_index, source_offering in enumerate(source_product.get("offerings") or []):
+            baseline_key = _stable_baseline_key(product, offering_index)
             old_price = _decimal_price(source_offering.get("price"))
             old_discounted_price = (old_price * multiplier).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
+            status = "inchangé"
+            status_detail = None
+            delivered_target = None
+            baseline_discounted_price = None
+            current_total = None
+            proposed_total = None
+            target_gap = None
             if pricing_profile == "kindle_sale_targets" and matched:
                 target_discounted_price = _kindle_discounted_target(
                     pricing_rule, old_discounted_price
@@ -478,6 +683,59 @@ def _clean_inventory_payload(
                 target_discounted_price = old_discounted_price
                 new_price = old_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 applied_adjustment = Decimal("0")
+            elif pricing_profile == "delivered_targets":
+                baseline_discounted_price = baselines.get(baseline_key, old_discounted_price)
+                target_discounted_price = old_discounted_price
+                new_price = old_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                applied_adjustment = Decimal("0")
+                if shipping_cost is not None:
+                    current_total = (old_discounted_price + shipping_cost).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                if shipping_error:
+                    status, status_detail = "à vérifier", shipping_error
+                elif not matched:
+                    status, status_detail = "à vérifier", match_error
+                else:
+                    delivered_target = delivered_config["targets"].get(pricing_rule)
+                    if delivered_target is None:
+                        status, status_detail = "à vérifier", "cible livrée absente"
+                    elif shipping_cost is None:
+                        status, status_detail = "à vérifier", "port France inconnu"
+                    elif shipping_cost >= delivered_target:
+                        status = "à vérifier"
+                        status_detail = "le port est supérieur ou égal à la cible livrée"
+                    else:
+                        proposed_discounted = (delivered_target - shipping_cost).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        if pricing_rule == "No strap":
+                            proposed_discounted = min(
+                                proposed_discounted,
+                                delivered_config["no_strap_cap"],
+                                baseline_discounted_price + delivered_config["no_strap_max_increase"],
+                            )
+                        candidate_price = _base_price_for_discounted_target(proposed_discounted, multiplier)
+                        if not delivered_config["allow_price_decreases"] and candidate_price < old_price:
+                            status = "déjà au-dessus de la cible"
+                            status_detail = "hausse uniquement : baisse non appliquée"
+                        else:
+                            new_price = candidate_price
+                            target_discounted_price = proposed_discounted
+                            applied_adjustment = new_price - old_price
+                            status = "modification" if new_price != old_price else "inchangé"
+                        final_discounted = (new_price * multiplier).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        proposed_total = (final_discounted + shipping_cost).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        target_gap = (proposed_total - delivered_target).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        if pricing_rule == "No strap" and proposed_total < delivered_target:
+                            prefix = f"{status_detail} · " if status_detail else ""
+                            status_detail = prefix + "plafond d’appel No strap"
             else:
                 new_price = (old_price + applied_adjustment).quantize(
                     Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -500,6 +758,8 @@ def _clean_inventory_payload(
                 "offering_index": offering_index,
                 "sku": product["sku"],
                 "variant": variant,
+                "model": model,
+                "style": style,
                 "enabled": offering["is_enabled"],
                 "is_no_strap": is_no_strap,
                 "pricing_rule": pricing_rule,
@@ -510,6 +770,20 @@ def _clean_inventory_payload(
                 "discounted_old_price": float(old_discounted_price),
                 "discounted_new_price": float(target_discounted_price),
                 "discounted_delta": float(target_discounted_price - old_discounted_price),
+                "promotion_percent": float(discount),
+                "promotion_source": promotion_source,
+                "shipping_cost": float(shipping_cost) if shipping_cost is not None else None,
+                "shipping_source": shipping_source,
+                "current_total": float(current_total) if current_total is not None else None,
+                "delivered_target": float(delivered_target) if delivered_target is not None else None,
+                "proposed_total": float(proposed_total) if proposed_total is not None else None,
+                "target_gap": float(target_gap) if target_gap is not None else None,
+                "baseline_key": baseline_key,
+                "baseline_discounted_price": (
+                    float(baseline_discounted_price) if baseline_discounted_price is not None else None
+                ),
+                "status": status,
+                "status_detail": status_detail,
             })
         products.append(product)
 
@@ -535,17 +809,27 @@ def listing_price_adjustment(
     no_strap_policy="full",
     expected_inventory_sha256=None,
     pricing_profile="fixed",
-    sale_discount_percent=40,
+    sale_discount_percent=None,
+    delivered_targets_json=None,
+    discounted_baselines_json=None,
+    expected_pricing_context_sha256=None,
+    promotion_source=None,
 ):
     """Prévisualise ou applique un montant fixe à chaque offering d'un listing."""
     try:
         adjustment = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise HTTPException(422, "Montant invalide") from exc
+    if pricing_profile == "delivered_targets" and sale_discount_percent is None:
+        raise HTTPException(422, "Le taux de promotion vérifié est obligatoire")
+    if sale_discount_percent is None:
+        sale_discount_percent = 40
     if pricing_profile == "fixed" and (adjustment == 0 or abs(adjustment) > Decimal("1000")):
         raise HTTPException(422, "Le montant doit être non nul et compris entre -1000 et 1000")
-    if pricing_profile not in {"fixed", "kindle_sale_targets"}:
+    if pricing_profile not in {"fixed", "kindle_sale_targets", "delivered_targets"}:
         raise HTTPException(422, "Profil de prix invalide")
+    if pricing_profile == "delivered_targets" and not promotion_source:
+        raise HTTPException(422, "La source du taux de promotion vérifié est obligatoire")
     if no_strap_policy not in {"full", "exclude", "half"}:
         raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
 
@@ -557,8 +841,56 @@ def listing_price_adjustment(
 
     inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
     require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    currency = next(
+        (
+            offering.get("price", {}).get("currency_code")
+            for product in inventory.get("products") or []
+            for offering in product.get("offerings") or []
+            if isinstance(offering.get("price"), dict)
+            and offering.get("price", {}).get("currency_code")
+        ), None,
+    )
+    delivered_context = None
+    pricing_context_sha256 = None
+    shipping_profile = None
+    if pricing_profile == "delivered_targets":
+        delivered_config = _parse_delivered_targets(delivered_targets_json)
+        if delivered_config["market"] != "FR" or delivered_config["currency"] != "EUR":
+            raise HTTPException(422, "Ce mode est limité au marché FR en EUR")
+        if delivered_config["quantity"] != 1:
+            raise HTTPException(422, "Ce mode exige une quantité de référence égale à 1")
+        if currency and str(currency).upper() != delivered_config["currency"]:
+            raise HTTPException(422, f"Devise du listing incompatible : {currency}")
+        baselines = _parse_discounted_baselines(discounted_baselines_json)
+        shipping_profile = _get_listing_shipping_profile(listing_id)
+        shipping_cost, shipping_source, shipping_error = _fr_primary_shipping(
+            shipping_profile, delivered_config["currency"]
+        )
+        context_payload = {
+            "shipping_profile": shipping_profile,
+            "promotion_percent": str(sale_discount_percent),
+            "promotion_source": str(promotion_source),
+            "targets": json.loads(delivered_targets_json),
+            "baselines": {key: str(value) for key, value in sorted(baselines.items())},
+        }
+        pricing_context_sha256 = _inventory_fingerprint(context_payload)
+        if apply and expected_pricing_context_sha256 != pricing_context_sha256:
+            raise HTTPException(
+                409,
+                "Le port, la promotion, les cibles ou la référence No strap ont changé depuis l’aperçu",
+            )
+        delivered_context = {
+            "config": delivered_config,
+            "shipping_cost": shipping_cost,
+            "shipping_source": shipping_source,
+            "shipping_error": shipping_error,
+            "baselines": baselines,
+            "promotion_source": promotion_source,
+        }
     backup_payload, backup_changes = _clean_inventory_payload(inventory, Decimal("0"))
     inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if pricing_profile == "delivered_targets" and apply and not expected_inventory_sha256:
+        raise HTTPException(422, "L’empreinte d’inventaire de l’aperçu est obligatoire")
     if apply and expected_inventory_sha256 and expected_inventory_sha256 != inventory_sha256:
         raise HTTPException(
             409,
@@ -570,16 +902,7 @@ def listing_price_adjustment(
         no_strap_policy,
         pricing_profile,
         sale_discount_percent,
-    )
-    currency = next(
-        (
-            offering.get("price", {}).get("currency_code")
-            for product in inventory.get("products") or []
-            for offering in product.get("offerings") or []
-            if isinstance(offering.get("price"), dict)
-            and offering.get("price", {}).get("currency_code")
-        ),
-        None,
+        delivered_context,
     )
     result = {
         "success": True,
@@ -596,7 +919,13 @@ def listing_price_adjustment(
         "count_changed": sum(change["old_price"] != change["new_price"] for change in changes),
         "count_no_strap": sum(change["is_no_strap"] for change in changes),
         "count_unmatched": sum(not change["matched"] for change in changes),
+        "count_review": sum(change.get("status") == "à vérifier" for change in changes),
+        "count_above_target": sum(
+            change.get("status") == "déjà au-dessus de la cible" for change in changes
+        ),
         "inventory_sha256": inventory_sha256,
+        "pricing_context_sha256": pricing_context_sha256,
+        "shipping_profile": shipping_profile,
         "count_enabled": sum(1 for change in changes if change["enabled"]),
         "changes": changes,
         "backup_payload": backup_payload,
@@ -993,7 +1322,11 @@ def adjust_listing_prices(
     no_strap_policy: str = "full",
     expected_inventory_sha256: str = None,
     pricing_profile: str = "fixed",
-    sale_discount_percent: float = 40,
+    sale_discount_percent: float = None,
+    delivered_targets_json: str = None,
+    discounted_baselines_json: str = None,
+    expected_pricing_context_sha256: str = None,
+    promotion_source: str = None,
 ):
     """Ajoute un montant fixe à toutes les options, avec aperçu par défaut."""
     return listing_price_adjustment(
@@ -1004,6 +1337,10 @@ def adjust_listing_prices(
         expected_inventory_sha256,
         pricing_profile,
         sale_discount_percent,
+        delivered_targets_json,
+        discounted_baselines_json,
+        expected_pricing_context_sha256,
+        promotion_source,
     )
 
 
