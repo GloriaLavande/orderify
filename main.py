@@ -375,15 +375,15 @@ def _kindle_discounted_target(rule, current_discounted_price):
     targets = {
         "No strap": Decimal("14.33"),
         "Clear Back No Strap": Decimal("18.90"),
-        "Built-in Hand Strap": Decimal("21.90"),
-        "ClearBack Hand Strap": Decimal("21.90"),
+        "Built-in Hand Strap": Decimal("21.90"),        "ClearBack Hand Strap": Decimal("21.60"),
+
     }
     if rule in targets:
         return targets[rule]
     if rule == "Rotate&Detach":
         reference_targets = (
             (Decimal("19.93"), Decimal("23.90")),
-            (Decimal("17.53"), Decimal("21.50")),
+            (Decimal("17.53"), Decimal("21.70")),
         )
         return min(
             reference_targets,
