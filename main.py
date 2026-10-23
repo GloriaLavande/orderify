@@ -13,14 +13,14 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -333,10 +333,99 @@ def _is_no_strap_variant(variant):
     return "no strap" in " ".join(str(variant or "").lower().split())
 
 
-def _clean_inventory_payload(inventory, adjustment, no_strap_policy="full"):
+def _inventory_fingerprint(payload):
+    """Empreinte stable du payload restaurable utilisé pour bloquer les données périmées."""
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _normalized_variant_name(variant):
+    value = unicodedata.normalize("NFKD", str(variant or ""))
+    value = "".join(char for char in value if not unicodedata.combining(char)).lower()
+    for token in ("·", "_", "/", "-", "&"):
+        value = value.replace(token, " ")
+    return " ".join(value.split())
+
+
+def _kindle_pricing_rule(variant):
+    """Classe une valeur de variation dans une règle de prix cible."""
+    normalized = _normalized_variant_name(variant)
+    if "clear back no strap" in normalized or "clearback no strap" in normalized:
+        return "Clear Back No Strap"
+    if (
+        "build in hand strap" in normalized
+        or "built in hand strap" in normalized
+    ):
+        return "Built-in Hand Strap"
+    if "clearback hand strap" in normalized or "clear back hand strap" in normalized:
+        return "ClearBack Hand Strap"
+    if "rotate detach" in normalized:
+        return "Rotate&Detach"
+    if "no strap" in normalized:
+        return "No strap"
+    return None
+
+
+def _kindle_discounted_target(rule, current_discounted_price):
+    targets = {
+        "No strap": Decimal("14.33"),
+        "Clear Back No Strap": Decimal("18.90"),
+        "Built-in Hand Strap": Decimal("21.90"),
+        "ClearBack Hand Strap": Decimal("21.90"),
+    }
+    if rule in targets:
+        return targets[rule]
+    if rule == "Rotate&Detach":
+        reference_targets = (
+            (Decimal("19.93"), Decimal("23.90")),
+            (Decimal("17.53"), Decimal("21.50")),
+        )
+        return min(
+            reference_targets,
+            key=lambda pair: abs(current_discounted_price - pair[0]),
+        )[1]
+    return None
+
+
+def _base_price_for_discounted_target(target, multiplier):
+    """Trouve un prix Etsy au centime donnant exactement la cible après remise."""
+    approximate = (target / multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    candidates = [approximate + Decimal(offset) / Decimal("100") for offset in range(-4, 5)]
+    exact = [
+        candidate
+        for candidate in candidates
+        if candidate > 0
+        and (candidate * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == target
+    ]
+    if not exact:
+        raise HTTPException(422, f"Impossible d’atteindre exactement le prix remisé {target}")
+    return min(exact, key=lambda candidate: abs(candidate - (target / multiplier)))
+
+
+def _clean_inventory_payload(
+    inventory,
+    adjustment,
+    no_strap_policy="full",
+    pricing_profile="fixed",
+    sale_discount_percent=40,
+):
     """Reconstruit le payload complet accepté par updateListingInventory."""
     if no_strap_policy not in {"full", "exclude", "half"}:
         raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
+    if pricing_profile not in {"fixed", "kindle_sale_targets"}:
+        raise HTTPException(422, "Profil de prix invalide")
+    try:
+        discount = Decimal(str(sale_discount_percent))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Promotion invalide") from exc
+    if discount < 0 or discount >= 100:
+        raise HTTPException(422, "La promotion doit être comprise entre 0 et 99,99 %")
+    multiplier = (Decimal("100") - discount) / Decimal("100")
     products = []
     changes = []
     for product_index, source_product in enumerate(inventory.get("products") or []):
@@ -360,18 +449,42 @@ def _clean_inventory_payload(inventory, adjustment, no_strap_policy="full"):
         ) or product["sku"] or f"Option {product_index + 1}"
         is_no_strap = _is_no_strap_variant(variant)
         applied_adjustment = adjustment
+        pricing_rule = "Montant fixe"
+        matched = True
         if is_no_strap and no_strap_policy == "exclude":
             applied_adjustment = Decimal("0")
         elif is_no_strap and no_strap_policy == "half":
             applied_adjustment = (adjustment / Decimal("2")).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
+        if pricing_profile == "kindle_sale_targets":
+            pricing_rule = _kindle_pricing_rule(variant) or "Non reconnue"
+            matched = pricing_rule != "Non reconnue"
 
         for offering_index, source_offering in enumerate(source_product.get("offerings") or []):
             old_price = _decimal_price(source_offering.get("price"))
-            new_price = (old_price + applied_adjustment).quantize(
+            old_discounted_price = (old_price * multiplier).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
+            if pricing_profile == "kindle_sale_targets" and matched:
+                target_discounted_price = _kindle_discounted_target(
+                    pricing_rule, old_discounted_price
+                )
+                new_price = _base_price_for_discounted_target(
+                    target_discounted_price, multiplier
+                )
+                applied_adjustment = new_price - old_price
+            elif pricing_profile == "kindle_sale_targets":
+                target_discounted_price = old_discounted_price
+                new_price = old_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                applied_adjustment = Decimal("0")
+            else:
+                new_price = (old_price + applied_adjustment).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                target_discounted_price = (new_price * multiplier).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
             if old_price <= 0 or new_price <= 0:
                 raise HTTPException(422, f"Prix invalide pour {variant}: {new_price}")
             offering = {
@@ -389,9 +502,14 @@ def _clean_inventory_payload(inventory, adjustment, no_strap_policy="full"):
                 "variant": variant,
                 "enabled": offering["is_enabled"],
                 "is_no_strap": is_no_strap,
+                "pricing_rule": pricing_rule,
+                "matched": matched,
                 "applied_adjustment": float(applied_adjustment),
                 "old_price": float(old_price.quantize(Decimal("0.01"))),
                 "new_price": float(new_price),
+                "discounted_old_price": float(old_discounted_price),
+                "discounted_new_price": float(target_discounted_price),
+                "discounted_delta": float(target_discounted_price - old_discounted_price),
             })
         products.append(product)
 
@@ -410,14 +528,24 @@ def _clean_inventory_payload(inventory, adjustment, no_strap_policy="full"):
     return payload, changes
 
 
-def listing_price_adjustment(listing_id, amount, apply=False, no_strap_policy="full"):
+def listing_price_adjustment(
+    listing_id,
+    amount,
+    apply=False,
+    no_strap_policy="full",
+    expected_inventory_sha256=None,
+    pricing_profile="fixed",
+    sale_discount_percent=40,
+):
     """Prévisualise ou applique un montant fixe à chaque offering d'un listing."""
     try:
         adjustment = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise HTTPException(422, "Montant invalide") from exc
-    if adjustment == 0 or abs(adjustment) > Decimal("1000"):
+    if pricing_profile == "fixed" and (adjustment == 0 or abs(adjustment) > Decimal("1000")):
         raise HTTPException(422, "Le montant doit être non nul et compris entre -1000 et 1000")
+    if pricing_profile not in {"fixed", "kindle_sale_targets"}:
+        raise HTTPException(422, "Profil de prix invalide")
     if no_strap_policy not in {"full", "exclude", "half"}:
         raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
 
@@ -429,8 +557,20 @@ def listing_price_adjustment(listing_id, amount, apply=False, no_strap_policy="f
 
     inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
     require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
-    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
-    payload, changes = _clean_inventory_payload(inventory, adjustment, no_strap_policy)
+    backup_payload, backup_changes = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if apply and expected_inventory_sha256 and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(
+            409,
+            "L’inventaire Etsy a changé depuis l’aperçu; aucune modification n’a été appliquée",
+        )
+    payload, changes = _clean_inventory_payload(
+        inventory,
+        adjustment,
+        no_strap_policy,
+        pricing_profile,
+        sale_discount_percent,
+    )
     currency = next(
         (
             offering.get("price", {}).get("currency_code")
@@ -450,15 +590,24 @@ def listing_price_adjustment(listing_id, amount, apply=False, no_strap_policy="f
         "currency": currency,
         "adjustment": float(adjustment),
         "no_strap_policy": no_strap_policy,
+        "pricing_profile": pricing_profile,
+        "sale_discount_percent": float(Decimal(str(sale_discount_percent))),
         "count_prices": len(changes),
         "count_changed": sum(change["old_price"] != change["new_price"] for change in changes),
         "count_no_strap": sum(change["is_no_strap"] for change in changes),
+        "count_unmatched": sum(not change["matched"] for change in changes),
+        "inventory_sha256": inventory_sha256,
         "count_enabled": sum(1 for change in changes if change["enabled"]),
         "changes": changes,
         "backup_payload": backup_payload,
     }
     if not apply:
         return result
+    if pricing_profile == "kindle_sale_targets" and result["count_unmatched"]:
+        raise HTTPException(
+            422,
+            "Certaines variantes ne correspondent à aucune règle; aucune modification appliquée",
+        )
 
     update_response, update_data = etsy_request(
         "PUT",
@@ -474,9 +623,116 @@ def listing_price_adjustment(listing_id, amount, apply=False, no_strap_policy="f
     actual_prices = [change["old_price"] for change in verified_changes]
     expected_prices = [change["new_price"] for change in changes]
     if actual_prices != expected_prices:
-        raise HTTPException(502, "Etsy a répondu, mais la vérification des prix ne correspond pas")
+        rollback_response, rollback_data = etsy_request(
+            "PUT",
+            f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"},
+            json_data=backup_payload,
+        )
+        require_etsy_success(
+            rollback_response,
+            rollback_data,
+            "Restauration automatique après échec de vérification",
+        )
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(
+            rollback_verify_response,
+            rollback_inventory,
+            "Vérification de la restauration automatique",
+        )
+        _, rollback_changes = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if [change["old_price"] for change in rollback_changes] != [
+            change["old_price"] for change in backup_changes
+        ]:
+            raise HTTPException(502, "ÉCHEC CRITIQUE : mise à jour et restauration non vérifiées")
+        raise HTTPException(
+            502,
+            "La vérification a échoué; les prix d’origine ont été restaurés et vérifiés",
+        )
     result.update({"applied": True, "verified": True})
     return result
+
+
+def listing_price_catalog():
+    """Liste les listings actifs et sauvegarde aussi leurs profils de livraison."""
+    shop_id = get_shop_id_for_user()
+    listings = []
+    offset = 0
+    page_size = 100
+    while True:
+        response, data = etsy_request(
+            "GET",
+            f"/shops/{shop_id}/listings",
+            params={"state": "active", "limit": page_size, "offset": offset},
+        )
+        require_etsy_success(response, data, "Récupération des listings actifs")
+        results = data.get("results") or []
+        listings.extend({
+            "listing_id": item.get("listing_id"),
+            "title": item.get("title"),
+            "state": item.get("state"),
+        } for item in results if item.get("listing_id") is not None)
+        if len(results) < page_size:
+            break
+        offset += page_size
+    shipping_by_listing = {}
+    listing_ids = [item["listing_id"] for item in listings]
+    for start in range(0, len(listing_ids), 100):
+        batch = listing_ids[start:start + 100]
+        response, data = etsy_request(
+            "GET",
+            "/listings/batch/shipping",
+            params={"listing_ids": ",".join(str(item) for item in batch)},
+        )
+        require_etsy_success(response, data, "Récupération des profils de livraison")
+        for item in data.get("results") or []:
+            if item.get("listing_id") is not None:
+                shipping_by_listing[int(item["listing_id"])] = item.get("shipping_profile")
+    for item in listings:
+        item["shipping_profile"] = shipping_by_listing.get(int(item["listing_id"]))
+    return {"success": True, "count": len(listings), "listings": listings}
+
+
+def restore_listing_inventory(listing_id, backup_payload):
+    """Restaure un inventaire sauvegardé puis vérifie chaque prix relu sur Etsy."""
+    if not isinstance(backup_payload, dict):
+        raise HTTPException(422, "Sauvegarde d’inventaire invalide")
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+
+    clean_payload, expected_changes = _clean_inventory_payload(
+        backup_payload, Decimal("0")
+    )
+    update_response, update_data = etsy_request(
+        "PUT",
+        f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"},
+        json_data=clean_payload,
+    )
+    require_etsy_success(update_response, update_data, "Restauration de l’inventaire")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request(
+        "GET", f"/listings/{listing_id}/inventory"
+    )
+    require_etsy_success(verify_response, verified_inventory, "Vérification de la restauration")
+    _, verified_changes = _clean_inventory_payload(verified_inventory, Decimal("0"))
+    if [change["old_price"] for change in verified_changes] != [
+        change["old_price"] for change in expected_changes
+    ]:
+        raise HTTPException(502, "La restauration Etsy n’a pas pu être vérifiée")
+    return {
+        "success": True,
+        "restored": True,
+        "verified": True,
+        "listing_id": listing_id,
+        "count_prices": len(expected_changes),
+        "inventory_sha256": _inventory_fingerprint(clean_payload),
+    }
 
 
 def receipt_to_rows(receipt, include_thumbnails=True, now=None):
@@ -735,9 +991,30 @@ def adjust_listing_prices(
     amount: float,
     apply: bool = False,
     no_strap_policy: str = "full",
+    expected_inventory_sha256: str = None,
+    pricing_profile: str = "fixed",
+    sale_discount_percent: float = 40,
 ):
     """Ajoute un montant fixe à toutes les options, avec aperçu par défaut."""
-    return listing_price_adjustment(listing_id, amount, apply, no_strap_policy)
+    return listing_price_adjustment(
+        listing_id,
+        amount,
+        apply,
+        no_strap_policy,
+        expected_inventory_sha256,
+        pricing_profile,
+        sale_discount_percent,
+    )
+
+
+@app.get("/listing-prices/catalog", tags=["pricing"], dependencies=PROTECTED)
+def get_listing_price_catalog():
+    return listing_price_catalog()
+
+
+@app.post("/listing-prices/{listing_id}/restore", tags=["pricing"], dependencies=PROTECTED)
+def restore_listing_prices(listing_id: int, backup_payload: dict = Body(...)):
+    return restore_listing_inventory(listing_id, backup_payload)
 
 
 @app.get("/listings-stats", tags=["analytics"], dependencies=PROTECTED)
