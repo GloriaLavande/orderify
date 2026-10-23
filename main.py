@@ -387,7 +387,7 @@ def _kindle_discounted_target(rule, current_discounted_price):
         )
         return min(
             reference_targets,
-            key=lambda pair: abs(current_discounted_price - pair[0]),
+            key=lambda pair: min(abs(current_discounted_price - pair[0]), abs(current_discounted_price - pair[1])),
         )[1]
     return None
 
