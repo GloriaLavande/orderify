@@ -101,6 +101,32 @@ class DeliveredTargetTests(unittest.TestCase):
         self.assertFalse(change["matched"])
         self.assertEqual(change["status"], "à vérifier")
 
+    def test_attraction_price_protects_only_exact_model_and_style(self):
+        protected_config = dict(CONFIG)
+        protected_config["attraction_price_overrides"] = [{
+            "model": "SY69JL",
+            "style": "No strap",
+            "discounted_price_eur": 13.33,
+        }]
+        protected_context = context("No strap", "5.85")
+        protected_context["config"] = backend._parse_delivered_targets(protected_config)
+        change = backend._clean_inventory_payload(
+            inventory("No strap", 2500, "SY69JL"), backend.Decimal("0"), "full",
+            "delivered_targets", 40, protected_context,
+        )[1][0]
+        self.assertEqual(change["pricing_rule"], "Prix d’attraction")
+        self.assertEqual(change["new_price"], 22.21)
+        self.assertEqual(change["discounted_new_price"], 13.33)
+        self.assertEqual(change["proposed_total"], 19.18)
+
+        other_style = backend._clean_inventory_payload(
+            inventory("Build-in Hand Strap", 2500, "SY69JL"),
+            backend.Decimal("0"), "full", "delivered_targets", 40,
+            protected_context,
+        )[1][0]
+        self.assertEqual(other_style["pricing_rule"], "Built-in Hand Strap")
+        self.assertTrue(other_style["matched"])
+
     def test_inventory_fields_are_preserved(self):
         payload, _changes = backend._clean_inventory_payload(
             inventory("Clear Back No Strap"), backend.Decimal("0"), "full",
