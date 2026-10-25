@@ -160,6 +160,19 @@ class DeliveredTargetTests(unittest.TestCase):
         self.assertEqual(other_style["pricing_rule"], "Built-in Hand Strap")
         self.assertTrue(other_style["matched"])
 
+    def test_disabled_attraction_anchor_is_reenabled_without_touching_other_style(self):
+        anchor = inventory("No strap", 3000, "SY69JL")["products"][0]
+        anchor["offerings"][0]["is_enabled"] = False
+        other = inventory("Build-in Hand Strap", 3550, "SY69JL")["products"][0]
+        payload, changes, counts = backend._ensure_attraction_anchor_payload(
+            {"products": [anchor, other]}, 40
+        )
+        self.assertEqual(counts["count_reenabled"], 1)
+        self.assertEqual(payload["products"][0]["offerings"][0]["price"], 22.21)
+        self.assertTrue(payload["products"][0]["offerings"][0]["is_enabled"])
+        self.assertEqual(payload["products"][1]["offerings"][0]["price"], 35.5)
+        self.assertEqual(changes[0]["discounted_price"], 13.33)
+
     def test_inventory_fields_are_preserved(self):
         payload, _changes = backend._clean_inventory_payload(
             inventory("Clear Back No Strap"), backend.Decimal("0"), "full",

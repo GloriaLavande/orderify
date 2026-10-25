@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -821,7 +821,12 @@ def _clean_inventory_payload(
             offering = {
                 "price": float(new_price),
                 "quantity": source_offering.get("quantity", 0),
-                "is_enabled": bool(source_offering.get("is_enabled", True)),
+                # Un prix d'attraction invisible ne peut pas remplir son rôle.
+                # L'override exact SY69JL + No strap implique donc sa disponibilité.
+                "is_enabled": (
+                    True if attraction_discounted_price is not None
+                    else bool(source_offering.get("is_enabled", True))
+                ),
             }
             if source_offering.get("readiness_state_id") is not None:
                 offering["readiness_state_id"] = source_offering["readiness_state_id"]
@@ -1234,6 +1239,157 @@ def normalize_rotate_detach_listing(
         raise HTTPException(
             502,
             f"Normalisation non vérifiée; inventaire initial restauré ({verification_error})",
+        )
+    result.update({"applied": True, "verified": True})
+    return result
+
+
+def _ensure_attraction_anchor_payload(inventory, sale_discount_percent=40):
+    """Réactive seulement SY69JL + No strap et garantit 13,33 EUR remisé."""
+    clean, _changes = _clean_inventory_payload(inventory, Decimal("0"))
+    try:
+        discount = Decimal(str(sale_discount_percent))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Promotion invalide") from exc
+    if discount < 0 or discount >= 100:
+        raise HTTPException(422, "La promotion doit être comprise entre 0 et 99,99 %")
+    multiplier = (Decimal("100") - discount) / Decimal("100")
+    catalog_price = _base_price_for_discounted_target(
+        Decimal("13.33"), multiplier, prefer_lowest=True
+    )
+    changes = []
+    matches = 0
+    for product_index, product in enumerate(clean.get("products") or []):
+        model, style = _product_model_style(
+            product.get("property_values") or [], product.get("sku")
+        )
+        if (
+            _normalized_variant_name(model) != "sy69jl"
+            or _normalized_variant_name(style) != "no strap"
+        ):
+            continue
+        for offering_index, offering in enumerate(product.get("offerings") or []):
+            matches += 1
+            old_price = _decimal_price(offering.get("price")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            was_enabled = bool(offering.get("is_enabled", True))
+            offering["price"] = float(catalog_price)
+            offering["is_enabled"] = True
+            changes.append({
+                "product_index": product_index,
+                "offering_index": offering_index,
+                "sku": product.get("sku") or "",
+                "old_price": float(old_price),
+                "new_price": float(catalog_price),
+                "was_enabled": was_enabled,
+                "is_enabled": True,
+                "discounted_price": 13.33,
+                "changed": old_price != catalog_price or not was_enabled,
+            })
+    return clean, changes, {
+        "anchor_found": matches > 0,
+        "anchor_count": matches,
+        "count_changed": sum(change["changed"] for change in changes),
+        "count_reenabled": sum(not change["was_enabled"] for change in changes),
+    }
+
+
+def ensure_attraction_anchor_listing(
+    listing_id,
+    apply=False,
+    sale_discount_percent=None,
+    promotion_source=None,
+    expected_inventory_sha256=None,
+    expected_pricing_context_sha256=None,
+):
+    """Aperçoit/applique la disponibilité du prix d'appel sans autre changement."""
+    if sale_discount_percent is None or not promotion_source:
+        raise HTTPException(422, "Promotion vérifiée et sa source obligatoires")
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if apply and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(409, "L'inventaire Etsy a changé depuis l'aperçu")
+    context = {
+        "sale_discount_percent": str(sale_discount_percent),
+        "promotion_source": str(promotion_source),
+        "model": "SY69JL",
+        "style": "No strap",
+        "discounted_price": "13.33",
+        "operation": "ensure_attraction_anchor_v1",
+    }
+    pricing_context_sha256 = _inventory_fingerprint(context)
+    if apply and expected_pricing_context_sha256 != pricing_context_sha256:
+        raise HTTPException(409, "La promotion ou la règle d'attraction a changé depuis l'aperçu")
+    payload, changes, counts = _ensure_attraction_anchor_payload(
+        inventory, sale_discount_percent
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "verified": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": "EUR",
+        "operation": "ensure_attraction_anchor",
+        "pricing_profile": "attraction_anchor",
+        "sale_discount_percent": float(Decimal(str(sale_discount_percent))),
+        "promotion_source": promotion_source,
+        "inventory_sha256": inventory_sha256,
+        "pricing_context_sha256": pricing_context_sha256,
+        "shipping_profile": None,
+        "count_prices": _count_inventory_offerings(backup_payload),
+        "changes": changes,
+        "backup_payload": backup_payload,
+        **counts,
+    }
+    if not apply or not counts["count_changed"]:
+        return result
+    expected_semantic = _semantic_inventory_fingerprint(payload)
+    update_response, update_data = etsy_request(
+        "PUT", f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"}, json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Activation du prix d'attraction")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request(
+        "GET", f"/listings/{listing_id}/inventory"
+    )
+    require_etsy_success(verify_response, verified_inventory, "Vérification du prix d'attraction")
+    try:
+        verified_clean, verified_changes, verified_counts = _ensure_attraction_anchor_payload(
+            verified_inventory, sale_discount_percent
+        )
+        if _semantic_inventory_fingerprint(verified_clean) != expected_semantic:
+            raise ValueError("inventaire relu différent")
+        if not verified_counts["anchor_found"] or verified_counts["count_changed"]:
+            raise ValueError("prix d'attraction absent, désactivé ou incorrect")
+        if any(not change["is_enabled"] or change["discounted_price"] != 13.33 for change in verified_changes):
+            raise ValueError("protection du prix d'attraction non vérifiée")
+    except Exception as verification_error:
+        rollback_response, rollback_data = etsy_request(
+            "PUT", f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"}, json_data=backup_payload,
+        )
+        require_etsy_success(rollback_response, rollback_data, "Restauration automatique")
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(rollback_verify_response, rollback_inventory, "Vérification de la restauration")
+        rollback_clean, _ = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(rollback_clean) != _semantic_inventory_fingerprint(backup_payload):
+            raise HTTPException(502, "ÉCHEC CRITIQUE : activation et restauration non vérifiées")
+        raise HTTPException(
+            502,
+            f"Activation non vérifiée; inventaire initial restauré ({verification_error})",
         )
     result.update({"applied": True, "verified": True})
     return result
@@ -1813,6 +1969,29 @@ def normalize_rotate_detach_variations(
         apply,
         sale_discount_percent,
         delivered_target,
+        promotion_source,
+        expected_inventory_sha256,
+        expected_pricing_context_sha256,
+    )
+
+
+@app.post(
+    "/listing-variations/{listing_id}/ensure-attraction-anchor",
+    tags=["pricing"],
+    dependencies=PROTECTED,
+)
+def ensure_attraction_anchor_variation(
+    listing_id: int,
+    apply: bool = False,
+    sale_discount_percent: float = None,
+    promotion_source: str = None,
+    expected_inventory_sha256: str = None,
+    expected_pricing_context_sha256: str = None,
+):
+    return ensure_attraction_anchor_listing(
+        listing_id,
+        apply,
+        sale_discount_percent,
         promotion_source,
         expected_inventory_sha256,
         expected_pricing_context_sha256,
