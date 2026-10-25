@@ -90,11 +90,44 @@ class DeliveredTargetTests(unittest.TestCase):
         self.assertEqual(change["status"], "à vérifier")
         self.assertEqual(change["new_price"], 25.0)
 
-    def test_detachable_with_strap_is_never_reclassified(self):
+    def test_detachable_with_strap_is_temporary_pricing_alias(self):
         with_strap = self.calculate("Rotate&Detach +Strap")
-        self.assertFalse(with_strap["matched"])
+        self.assertTrue(with_strap["matched"])
+        self.assertEqual(with_strap["pricing_rule"], "Rotate&Detach sans sangle - standard")
         plain = self.calculate("Rotate&Detach")
         self.assertEqual(plain["pricing_rule"], "Rotate&Detach sans sangle - standard")
+
+    def test_normalizer_renames_and_prices_from_real_shipping(self):
+        for shipping in ("0", "5.85", "6.25"):
+            payload, _changes, counts = backend._normalize_rotate_inventory(
+                inventory("Rotate&Detach +Strap"), backend.Decimal(shipping), 40, 29.99
+            )
+            product = payload["products"][0]
+            self.assertEqual(product["property_values"][1]["values"], ["Rotate&Detach"])
+            price = backend.Decimal(str(product["offerings"][0]["price"]))
+            total = (price * backend.Decimal("0.60")).quantize(
+                backend.Decimal("0.01"), rounding=backend.ROUND_HALF_UP
+            ) + backend.Decimal(shipping)
+            self.assertEqual(total, backend.Decimal("29.99"))
+            self.assertEqual(counts["count_renamed"], 1)
+
+    def test_normalizer_merges_only_lossless_duplicate(self):
+        plus = inventory("Rotate&Detach +Strap")["products"][0]
+        plain = inventory("Rotate&Detach")["products"][0]
+        plain["offerings"][0]["is_enabled"] = False
+        payload, _changes, counts = backend._normalize_rotate_inventory(
+            {"products": [plus, plain]}, backend.Decimal("5.85"), 40, 29.99
+        )
+        self.assertEqual(len(payload["products"]), 1)
+        self.assertTrue(payload["products"][0]["offerings"][0]["is_enabled"])
+        self.assertEqual(counts["count_merged"], 1)
+
+        plain = inventory("Rotate&Detach")["products"][0]
+        plain["sku"] = "DIFFERENT"
+        with self.assertRaises(backend.HTTPException):
+            backend._normalize_rotate_inventory(
+                {"products": [plus, plain]}, backend.Decimal("5.85"), 40, 29.99
+            )
 
     def test_special_models_require_review(self):
         change = self.calculate("Clear Back No Strap", model="Kindle Scribe")
