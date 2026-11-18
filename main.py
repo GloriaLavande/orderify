@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.6.1"
+APP_VERSION = "3.7.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -950,6 +950,153 @@ def _semantic_inventory_fingerprint(inventory):
     return _inventory_fingerprint(root)
 
 
+def _device_property_index(product):
+    """Return the single property that represents the reader/device model."""
+    matches = []
+    for index, item in enumerate(product.get("property_values") or []):
+        name = _normalized_variant_name(item.get("property_name") or "")
+        if any(token in name for token in ("device", "model", "kindle", "kobo", "reader")):
+            matches.append(index)
+    if len(matches) > 1:
+        raise HTTPException(422, "Plusieurs propriétés Device ambiguës dans un produit")
+    return matches[0] if matches else None
+
+
+def _device_value(product):
+    index = _device_property_index(product)
+    if index is None:
+        return None
+    values = product["property_values"][index].get("values") or []
+    return " / ".join(str(value).strip() for value in values if str(value).strip())
+
+
+def _device_combination_signature(product):
+    """Identify a product by every variation except Device."""
+    device_index = _device_property_index(product)
+    values = []
+    for index, item in enumerate(product.get("property_values") or []):
+        if index == device_index:
+            continue
+        values.append((
+            item.get("property_id"),
+            _normalized_variant_name(item.get("property_name") or ""),
+            tuple(sorted(_normalized_variant_name(value) for value in (item.get("values") or []))),
+        ))
+    return tuple(sorted(values, key=lambda item: (str(item[0]), item[1], item[2])))
+
+
+def _canonical_device_style(style):
+    return _kindle_pricing_rule(style) or _normalized_variant_name(style)
+
+
+def _parse_device_styles(raw_styles):
+    if raw_styles in (None, "", []):
+        return []
+    try:
+        styles = json.loads(raw_styles) if isinstance(raw_styles, str) else list(raw_styles)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Liste de styles Device invalide") from exc
+    if not isinstance(styles, list):
+        raise HTTPException(422, "La liste de styles Device doit être un tableau")
+    cleaned = [str(style).strip() for style in styles if str(style).strip()]
+    if len({_canonical_device_style(style) for style in cleaned}) != len(cleaned):
+        raise HTTPException(422, "La liste de styles Device contient des doublons")
+    return cleaned
+
+
+def _add_device_option_payload(inventory, source_device, new_device, included_styles=None):
+    """Clone all combinations of one Device value under a new Device value."""
+    clean, _changes = _clean_inventory_payload(inventory, Decimal("0"))
+    source_key = _normalized_variant_name(source_device)
+    new_key = _normalized_variant_name(new_device)
+    if not source_key or not new_key:
+        raise HTTPException(422, "Le Device source et le nouveau Device sont obligatoires")
+    if source_key == new_key:
+        raise HTTPException(422, "Le nouveau Device doit être différent du Device source")
+
+    all_source_products = [
+        product for product in clean.get("products") or []
+        if _normalized_variant_name(_device_value(product)) == source_key
+    ]
+    if not all_source_products:
+        raise HTTPException(422, f"Device source introuvable : {source_device}")
+
+    included_styles = _parse_device_styles(included_styles)
+    selected_style_keys = {_canonical_device_style(style) for style in included_styles}
+    source_products = []
+    found_style_keys = set()
+    for product in all_source_products:
+        _model, style = _product_model_style(
+            product.get("property_values"), product.get("sku")
+        )
+        style_key = _canonical_device_style(style)
+        if not selected_style_keys or style_key in selected_style_keys:
+            source_products.append(product)
+            found_style_keys.add(style_key)
+    missing_styles = selected_style_keys - found_style_keys
+    if missing_styles:
+        missing_labels = [
+            style for style in included_styles
+            if _canonical_device_style(style) in missing_styles
+        ]
+        raise HTTPException(
+            422,
+            "Styles absents du Device source : " + ", ".join(missing_labels),
+        )
+
+    target_products = [
+        product for product in clean.get("products") or []
+        if _normalized_variant_name(_device_value(product)) == new_key
+    ]
+    source_signatures = sorted(repr(_device_combination_signature(item)) for item in source_products)
+    target_signatures = sorted(repr(_device_combination_signature(item)) for item in target_products)
+    if target_products:
+        if target_signatures != source_signatures:
+            raise HTTPException(
+                422,
+                f"Le Device {new_device} existe partiellement ou avec des combinaisons différentes",
+            )
+        return clean, [], {
+            "affected": False,
+            "already_exists": True,
+            "count_added": 0,
+            "count_products_before": len(clean["products"]),
+            "count_products_after": len(clean["products"]),
+            "included_styles": included_styles,
+        }
+
+    additions = []
+    changes = []
+    for source_product in source_products:
+        cloned = json.loads(json.dumps(source_product, ensure_ascii=False))
+        device_index = _device_property_index(cloned)
+        if device_index is None:
+            raise HTTPException(422, "Produit source sans propriété Device")
+        device_property = cloned["property_values"][device_index]
+        device_property["values"] = [str(new_device).strip()]
+        device_property["value_ids"] = []
+        additions.append(cloned)
+        _model, style = _product_model_style(cloned.get("property_values"), cloned.get("sku"))
+        changes.append({
+            "source_device": str(source_device).strip(),
+            "new_device": str(new_device).strip(),
+            "style": style,
+            "sku": cloned.get("sku") or "",
+            "count_offerings": len(cloned.get("offerings") or []),
+        })
+
+    before = len(clean["products"])
+    clean["products"].extend(additions)
+    return clean, changes, {
+        "affected": True,
+        "already_exists": False,
+        "count_added": len(additions),
+        "count_products_before": before,
+        "count_products_after": len(clean["products"]),
+        "included_styles": included_styles,
+    }
+
+
 def _count_inventory_offerings(inventory):
     return sum(len(product.get("offerings") or []) for product in inventory.get("products") or [])
 
@@ -1239,6 +1386,114 @@ def normalize_rotate_detach_listing(
         raise HTTPException(
             502,
             f"Normalisation non vérifiée; inventaire initial restauré ({verification_error})",
+        )
+    result.update({"applied": True, "verified": True})
+    return result
+
+
+def add_device_option_listing(
+    listing_id,
+    source_device,
+    new_device,
+    included_styles=None,
+    apply=False,
+    expected_inventory_sha256=None,
+    expected_operation_sha256=None,
+):
+    """Preview or atomically add a Device value by cloning a reference value."""
+    source_device = str(source_device or "").strip()
+    new_device = str(new_device or "").strip()
+    included_styles = _parse_device_styles(included_styles)
+    if not source_device or not new_device:
+        raise HTTPException(422, "Le Device source et le nouveau Device sont obligatoires")
+
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if apply and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(409, "L'inventaire Etsy a changé depuis l'aperçu")
+
+    operation_context = {
+        "operation": "add_device_option_v1",
+        "source_device": source_device,
+        "new_device": new_device,
+        "included_styles": included_styles,
+    }
+    operation_sha256 = _inventory_fingerprint(operation_context)
+    if apply and expected_operation_sha256 != operation_sha256:
+        raise HTTPException(409, "Le Device source ou le nouveau Device a changé depuis l'aperçu")
+
+    payload, changes, counts = _add_device_option_payload(
+        inventory, source_device, new_device, included_styles
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "verified": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": "EUR",
+        "operation": "add_device_option",
+        "pricing_profile": "device_option_clone",
+        "source_device": source_device,
+        "new_device": new_device,
+        "included_styles": included_styles,
+        "inventory_sha256": inventory_sha256,
+        "operation_sha256": operation_sha256,
+        "pricing_context_sha256": operation_sha256,
+        "count_prices": _count_inventory_offerings(backup_payload),
+        "changes": changes,
+        "backup_payload": backup_payload,
+        **counts,
+    }
+    if not apply or not counts["affected"]:
+        return result
+
+    expected_semantic = _semantic_inventory_fingerprint(payload)
+    update_response, update_data = etsy_request(
+        "PUT", f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"}, json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Ajout du nouveau Device")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request(
+        "GET", f"/listings/{listing_id}/inventory"
+    )
+    require_etsy_success(verify_response, verified_inventory, "Vérification du nouveau Device")
+    try:
+        verified_clean, _ = _clean_inventory_payload(verified_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(verified_clean) != expected_semantic:
+            raise ValueError("inventaire relu différent")
+        _verified_payload, _verified_changes, verified_counts = _add_device_option_payload(
+            verified_inventory, source_device, new_device, included_styles
+        )
+        if not verified_counts["already_exists"]:
+            raise ValueError("le nouveau Device n'est pas complet après relecture")
+    except Exception as verification_error:
+        rollback_response, rollback_data = etsy_request(
+            "PUT", f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"}, json_data=backup_payload,
+        )
+        require_etsy_success(rollback_response, rollback_data, "Restauration automatique")
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(
+            rollback_verify_response, rollback_inventory, "Vérification de la restauration"
+        )
+        rollback_clean, _ = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(rollback_clean) != _semantic_inventory_fingerprint(backup_payload):
+            raise HTTPException(502, "ÉCHEC CRITIQUE : ajout et restauration non vérifiés")
+        raise HTTPException(
+            502,
+            f"Ajout non vérifié; inventaire initial restauré ({verification_error})",
         )
     result.update({"applied": True, "verified": True})
     return result
@@ -1995,6 +2250,31 @@ def ensure_attraction_anchor_variation(
         promotion_source,
         expected_inventory_sha256,
         expected_pricing_context_sha256,
+    )
+
+
+@app.post(
+    "/listing-variations/{listing_id}/add-device-option",
+    tags=["pricing"],
+    dependencies=PROTECTED,
+)
+def add_device_option(
+    listing_id: int,
+    source_device: str,
+    new_device: str,
+    included_styles_json: str = None,
+    apply: bool = False,
+    expected_inventory_sha256: str = None,
+    expected_operation_sha256: str = None,
+):
+    return add_device_option_listing(
+        listing_id,
+        source_device,
+        new_device,
+        included_styles_json,
+        apply=apply,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_operation_sha256=expected_operation_sha256,
     )
 
 
