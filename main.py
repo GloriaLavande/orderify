@@ -950,8 +950,8 @@ def _semantic_inventory_fingerprint(inventory):
     return _inventory_fingerprint(root)
 
 
-def _device_property_index(product):
-    """Return the single property that represents the reader/device model."""
+def _device_property_index(product, expected_device=None):
+    """Return Device by its property name, or by an exact expected value."""
     matches = []
     for index, item in enumerate(product.get("property_values") or []):
         name = _normalized_variant_name(item.get("property_name") or "")
@@ -959,20 +959,36 @@ def _device_property_index(product):
             matches.append(index)
     if len(matches) > 1:
         raise HTTPException(422, "Plusieurs propriétés Device ambiguës dans un produit")
-    return matches[0] if matches else None
+    if matches:
+        return matches[0]
+    expected_key = _normalized_variant_name(expected_device)
+    if expected_key:
+        value_matches = []
+        for index, item in enumerate(product.get("property_values") or []):
+            joined = " / ".join(
+                str(value).strip() for value in (item.get("values") or [])
+                if str(value).strip()
+            )
+            if _normalized_variant_name(joined) == expected_key:
+                value_matches.append(index)
+        if len(value_matches) > 1:
+            raise HTTPException(422, "Plusieurs valeurs Device identiques dans un produit")
+        if value_matches:
+            return value_matches[0]
+    return None
 
 
-def _device_value(product):
-    index = _device_property_index(product)
+def _device_value(product, expected_device=None):
+    index = _device_property_index(product, expected_device)
     if index is None:
         return None
     values = product["property_values"][index].get("values") or []
     return " / ".join(str(value).strip() for value in values if str(value).strip())
 
 
-def _device_combination_signature(product):
+def _device_combination_signature(product, expected_device=None):
     """Identify a product by every variation except Device."""
-    device_index = _device_property_index(product)
+    device_index = _device_property_index(product, expected_device)
     values = []
     for index, item in enumerate(product.get("property_values") or []):
         if index == device_index:
@@ -1016,7 +1032,7 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
 
     all_source_products = [
         product for product in clean.get("products") or []
-        if _normalized_variant_name(_device_value(product)) == source_key
+        if _normalized_variant_name(_device_value(product, source_device)) == source_key
     ]
     if not all_source_products:
         raise HTTPException(422, f"Device source introuvable : {source_device}")
@@ -1046,10 +1062,14 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
 
     target_products = [
         product for product in clean.get("products") or []
-        if _normalized_variant_name(_device_value(product)) == new_key
+        if _normalized_variant_name(_device_value(product, new_device)) == new_key
     ]
-    source_signatures = sorted(repr(_device_combination_signature(item)) for item in source_products)
-    target_signatures = sorted(repr(_device_combination_signature(item)) for item in target_products)
+    source_signatures = sorted(
+        repr(_device_combination_signature(item, source_device)) for item in source_products
+    )
+    target_signatures = sorted(
+        repr(_device_combination_signature(item, new_device)) for item in target_products
+    )
     if target_products:
         if target_signatures != source_signatures:
             raise HTTPException(
@@ -1069,7 +1089,7 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
     changes = []
     for source_product in source_products:
         cloned = json.loads(json.dumps(source_product, ensure_ascii=False))
-        device_index = _device_property_index(cloned)
+        device_index = _device_property_index(cloned, source_device)
         if device_index is None:
             raise HTTPException(422, "Produit source sans propriété Device")
         device_property = cloned["property_values"][device_index]

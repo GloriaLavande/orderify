@@ -225,6 +225,23 @@ class BackendContractTests(unittest.TestCase):
             )
         self.assertIn("Styles absents", raised.exception.detail)
 
+    def test_add_device_detects_unnamed_etsy_device_property_by_exact_value(self):
+        inventory = delivered_inventory("No strap", model="RS23CV/C2V2L3")
+        inventory["products"][0]["property_values"][0].pop("property_name")
+        payload, changes, counts = backend._add_device_option_payload(
+            inventory, "RS23CV/C2V2L3", "Z8PC57", ["No strap"]
+        )
+        self.assertEqual(counts["count_added"], 1)
+        self.assertEqual(changes[0]["new_device"], "Z8PC57")
+        added = payload["products"][1]
+        self.assertEqual(added["property_values"][0]["values"], ["Z8PC57"])
+        repeated, no_changes, repeated_counts = backend._add_device_option_payload(
+            payload, "RS23CV/C2V2L3", "Z8PC57", ["No strap"]
+        )
+        self.assertTrue(repeated_counts["already_exists"])
+        self.assertEqual(no_changes, [])
+        self.assertEqual(len(repeated["products"]), 2)
+
     def test_add_device_listing_requires_fresh_preview_and_verifies_full_inventory(self):
         response = type("Response", (), {"status_code": 200})()
         before = delivered_inventory("No strap", model="OLD")
