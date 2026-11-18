@@ -9,17 +9,18 @@ import threading
 import time
 import unicodedata
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.7.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -28,7 +29,7 @@ REDIRECT_URI = os.getenv("REDIRECT_URI")
 API_KEY = os.getenv("ORDERIFY_API_KEY")
 ENV_REFRESH_TOKEN = os.getenv("ETSY_REFRESH_TOKEN")
 
-SCOPES = "transactions_r transactions_w shops_r listings_r"
+SCOPES = "transactions_r transactions_w shops_r listings_r listings_w"
 AUTH_URL = "https://www.etsy.com/oauth/connect"
 TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 API_BASE = "https://openapi.etsy.com/v3/application"
@@ -46,6 +47,7 @@ app = FastAPI(
         {"name": "orders", "description": "Commandes et articles Etsy."},
         {"name": "shipping", "description": "Suivi et transporteurs."},
         {"name": "analytics", "description": "Données et statistiques des listings."},
+        {"name": "pricing", "description": "Aperçu et modification sécurisée des prix."},
         {"name": "admin", "description": "Actions administratives protégées."},
     ],
 )
@@ -183,18 +185,19 @@ def get_headers():
     }
 
 
-def etsy_request(method, path, *, params=None, data=None, authenticated=True):
+def etsy_request(method, path, *, params=None, data=None, json_data=None, authenticated=True):
     url = path if path.startswith("http") else f"{API_BASE}{path}"
     headers = get_headers() if authenticated else None
     try:
-        response = ETSY_SESSION.request(
-            method,
-            url,
-            headers=headers,
-            params=params,
-            data=data,
-            timeout=REQUEST_TIMEOUT,
-        )
+        request_kwargs = {
+            "headers": headers,
+            "params": params,
+            "data": data,
+            "timeout": REQUEST_TIMEOUT,
+        }
+        if json_data is not None:
+            request_kwargs["json"] = json_data
+        response = ETSY_SESSION.request(method, url, **request_kwargs)
     except requests.RequestException as exc:
         raise HTTPException(502, f"Etsy est momentanément inaccessible: {exc}") from exc
     return response, _safe_json(response)
@@ -315,6 +318,1601 @@ def get_listing_inventory_sku(listing_id, variations):
 def money_value(value):
     value = value or {}
     return (value.get("amount", 0) or 0) / (value.get("divisor", 100) or 100)
+
+
+def _decimal_price(value):
+    """Convertit un prix Etsy (Money ou nombre) en Decimal sans erreur de float."""
+    if isinstance(value, dict):
+        divisor = Decimal(str(value.get("divisor") or 100))
+        return Decimal(str(value.get("amount") or 0)) / divisor
+    return Decimal(str(value))
+
+
+def _is_no_strap_variant(variant):
+    """Repère les options Etsy dont une valeur de variation contient « No strap »."""
+    return "no strap" in " ".join(str(variant or "").lower().split())
+
+
+def _inventory_fingerprint(payload):
+    """Empreinte stable du payload restaurable utilisé pour bloquer les données périmées."""
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _normalized_variant_name(variant):
+    value = unicodedata.normalize("NFKD", str(variant or ""))
+    value = "".join(char for char in value if not unicodedata.combining(char)).lower()
+    for token in ("·", "_", "/", "-", "&", "+"):
+        value = value.replace(token, " ")
+    return " ".join(value.split())
+
+
+def _kindle_pricing_rule(variant):
+    """Classe une valeur de variation dans une règle de prix cible."""
+    normalized = _normalized_variant_name(variant)
+    if "clear back no strap" in normalized or "clearback no strap" in normalized:
+        return "Clear Back No Strap"
+    if (
+        "build in hand strap" in normalized
+        or "built in hand strap" in normalized
+    ):
+        return "Built-in Hand Strap"
+    if "clearback hand strap" in normalized or "clear back hand strap" in normalized:
+        return "ClearBack Hand Strap"
+    if "rotate detach" in normalized:
+        return "Rotate&Detach"
+    if "no strap" in normalized:
+        return "No strap"
+    return None
+
+
+def _kindle_discounted_target(rule, current_discounted_price):
+    targets = {
+        "No strap": Decimal("14.33"),
+        "Clear Back No Strap": Decimal("18.90"),
+        "Built-in Hand Strap": Decimal("21.90"),
+        "ClearBack Hand Strap": Decimal("21.60"),
+    }
+    if rule in targets:
+        return targets[rule]
+    if rule == "Rotate&Detach":
+        reference_targets = (
+            (Decimal("19.93"), Decimal("23.90")),
+            (Decimal("17.53"), Decimal("21.70")),
+        )
+        return min(
+            reference_targets,
+            key=lambda pair: min(
+                abs(current_discounted_price - pair[0]),
+                abs(current_discounted_price - pair[1]),
+            ),
+        )[1]
+    return None
+
+
+def _parse_delivered_targets(raw_config):
+    """Valide la politique locale transmise au backend pour les totaux livrés."""
+    if not raw_config:
+        raise HTTPException(422, "Configuration des prix livrés manquante")
+    try:
+        config = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Configuration des prix livrés invalide") from exc
+    targets = config.get("delivered_targets_eur") or config.get("targets")
+    required = {
+        "No strap",
+        "Clear Back No Strap",
+        "Built-in Hand Strap",
+        "ClearBack Hand Strap",
+        "Rotate&Detach sans sangle - standard",
+    }
+    if not isinstance(targets, dict) or not required.issubset(targets):
+        raise HTTPException(422, "La configuration ne contient pas toutes les cibles livrées")
+    try:
+        normalized_targets = {
+            key: Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            for key, value in targets.items()
+        }
+        no_strap_cap = Decimal(str(
+            config.get("no_strap_discounted_item_cap_eur", "14.33")
+        )).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        no_strap_max_increase = Decimal(str(
+            config.get("no_strap_maximum_discounted_increase_from_saved_baseline_eur", "1.00")
+        )).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Montant invalide dans la configuration des prix livrés") from exc
+    if any(value <= 0 for value in normalized_targets.values()):
+        raise HTTPException(422, "Les cibles livrées doivent être positives")
+    if no_strap_cap <= 0 or no_strap_max_increase < 0:
+        raise HTTPException(422, "Plafond No strap invalide")
+    attraction_overrides = []
+    for index, item in enumerate(config.get("attraction_price_overrides") or []):
+        if not isinstance(item, dict):
+            raise HTTPException(422, f"Prix d’attraction invalide à la ligne {index + 1}")
+        model = _normalized_variant_name(item.get("model"))
+        style = _normalized_variant_name(item.get("style"))
+        try:
+            discounted_price = Decimal(str(item.get("discounted_price_eur"))).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise HTTPException(422, f"Prix d’attraction invalide à la ligne {index + 1}") from exc
+        if not model or not style or discounted_price <= 0:
+            raise HTTPException(422, f"Prix d’attraction incomplet à la ligne {index + 1}")
+        attraction_overrides.append({
+            "model": model,
+            "style": style,
+            "discounted_price": discounted_price,
+        })
+    return {
+        "market": str(config.get("market") or "FR").upper(),
+        "currency": str(config.get("currency") or "EUR").upper(),
+        "quantity": int(config.get("quantity") or 1),
+        "shipping_service": str(config.get("shipping_service") or "standard"),
+        "allow_price_decreases": bool(config.get("allow_price_decreases", False)),
+        "targets": normalized_targets,
+        "no_strap_cap": no_strap_cap,
+        "no_strap_max_increase": no_strap_max_increase,
+        "rotate_low_patterns": [
+            _normalized_variant_name(item)
+            for item in (config.get("rotate_detach_low_model_patterns") or [])
+            if str(item).strip()
+        ],
+        "review_model_keywords": [
+            _normalized_variant_name(item)
+            for item in (config.get("review_model_keywords") or ["scribe", "oasis", "kobo", "fire"])
+            if str(item).strip()
+        ],
+        "attraction_overrides": attraction_overrides,
+    }
+
+
+def _parse_discounted_baselines(raw_baselines):
+    if not raw_baselines:
+        return {}
+    try:
+        values = json.loads(raw_baselines) if isinstance(raw_baselines, str) else dict(raw_baselines)
+        return {
+            str(key): Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            for key, value in values.items()
+        }
+    except (TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Références No strap invalides") from exc
+
+
+def _attraction_price_override(model, style, config):
+    """Retourne le prix d’appel exact d’une combinaison explicitement protégée."""
+    normalized_model = _normalized_variant_name(model)
+    normalized_style = _normalized_variant_name(style)
+    for item in config.get("attraction_overrides") or []:
+        if item["model"] == normalized_model and item["style"] == normalized_style:
+            return item["discounted_price"]
+    return None
+
+
+def _product_model_style(property_values, sku=""):
+    """Extrait modèle et style sans dépendre de la position des propriétés Etsy."""
+    model_values = []
+    style_values = []
+    other_values = []
+    for item in property_values or []:
+        values = [str(value) for value in (item.get("values") or []) if str(value).strip()]
+        name = _normalized_variant_name(item.get("property_name") or "")
+        if any(token in name for token in ("model", "device", "kindle", "kobo", "reader")):
+            model_values.extend(values)
+        elif any(token in name for token in ("style", "case", "cover", "strap")):
+            style_values.extend(values)
+        else:
+            other_values.extend(values)
+    all_values = model_values + style_values + other_values
+    if not style_values:
+        style_values = [
+            value for value in all_values
+            if any(token in _normalized_variant_name(value) for token in (
+                "strap", "clear back", "clearback", "rotate", "detach", "magnetic"
+            ))
+        ]
+    if not model_values:
+        style_set = set(style_values)
+        model_values = [value for value in all_values if value not in style_set]
+    return (
+        " / ".join(model_values) or str(sku or "Modèle inconnu"),
+        " / ".join(style_values) or "Style inconnu",
+    )
+
+
+def _stable_baseline_key(product, offering_index):
+    """Identité stable d'une offre, indépendante de l'ordre des produits Etsy."""
+    identity = {
+        "sku": product.get("sku") or "",
+        "property_values": [{
+            "property_id": item.get("property_id"),
+            "value_ids": item.get("value_ids") or [],
+            "values": item.get("values") or [],
+        } for item in product.get("property_values") or []],
+        "offering_index": offering_index,
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"{product.get('sku') or 'sans-sku'}:{digest}"
+
+
+def _delivered_pricing_rule(model, style, config):
+    """Classe uniquement des constructions certaines; aucune proximité de prix."""
+    normalized_model = _normalized_variant_name(model)
+    normalized_style = _normalized_variant_name(style)
+    combined = f"{normalized_model} {normalized_style}".strip()
+    special = next(
+        (keyword for keyword in config["review_model_keywords"] if keyword in normalized_model),
+        None,
+    )
+    if special:
+        return None, f"modèle particulier à vérifier ({special})"
+    if "clear back no strap" in combined or "clearback no strap" in combined:
+        return "Clear Back No Strap", None
+    if "build in hand strap" in combined or "built in hand strap" in combined:
+        return "Built-in Hand Strap", None
+    if "clearback hand strap" in combined or "clear back hand strap" in combined:
+        return "ClearBack Hand Strap", None
+    if "rotate detach" in combined:
+        # Ancien nom erroné de l'usine. Il reste un alias tarifaire temporaire
+        # jusqu'à ce que la migration d'inventaire l'ait supprimé partout.
+        if any(pattern in normalized_model for pattern in config["rotate_low_patterns"]):
+            if "Rotate&Detach sans sangle - bas" not in config["targets"]:
+                return None, "cible du niveau bas absente"
+            return "Rotate&Detach sans sangle - bas", None
+        return "Rotate&Detach sans sangle - standard", None
+    if "side magnetic" in combined or "magnetic back" in combined:
+        return None, "construction magnétique distincte à vérifier"
+    if "no strap" in combined or "sans sangle" in combined:
+        return "No strap", None
+    return None, "variante inconnue"
+
+
+def _get_listing_shipping_profile(listing_id):
+    response, data = etsy_request(
+        "GET",
+        "/listings/batch/shipping",
+        params={"listing_ids": str(listing_id)},
+    )
+    require_etsy_success(response, data, "Récupération du profil de livraison")
+    for item in data.get("results") or []:
+        if int(item.get("listing_id") or 0) == int(listing_id):
+            return item.get("shipping_profile")
+    return None
+
+
+def _fr_primary_shipping(profile, currency="EUR"):
+    """Retourne le port principal FR d'un profil manuel, jamais le coût additionnel."""
+    if not isinstance(profile, dict):
+        return None, None, "profil de livraison inconnu"
+    if str(profile.get("profile_type") or "manual").lower() != "manual":
+        return None, None, "livraison calculée : devis France requis"
+    for destination in profile.get("shipping_profile_destinations") or []:
+        if str(destination.get("destination_country_iso") or "").upper() != "FR":
+            continue
+        money = destination.get("primary_cost")
+        if not isinstance(money, dict) or money.get("amount") is None:
+            return None, None, "coût principal France inconnu"
+        money_currency = str(money.get("currency_code") or currency).upper()
+        if money_currency != str(currency).upper():
+            return None, None, f"devise du port inattendue ({money_currency})"
+        divisor = Decimal(str(money.get("divisor") or 100))
+        cost = (Decimal(str(money.get("amount"))) / divisor).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        return cost, "profil Etsy · destination FR · primary_cost", None
+    return None, None, "destination France absente du profil"
+
+
+def _base_price_for_discounted_target(target, multiplier, prefer_lowest=False):
+    """Trouve un prix Etsy au centime donnant exactement la cible après remise."""
+    approximate = (target / multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    candidates = [approximate + Decimal(offset) / Decimal("100") for offset in range(-4, 5)]
+    exact = [
+        candidate
+        for candidate in candidates
+        if candidate > 0
+        and (candidate * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == target
+    ]
+    if not exact:
+        raise HTTPException(422, f"Impossible d’atteindre exactement le prix remisé {target}")
+    if prefer_lowest:
+        return min(exact)
+    return min(exact, key=lambda candidate: abs(candidate - (target / multiplier)))
+
+
+def _clean_inventory_payload(
+    inventory,
+    adjustment,
+    no_strap_policy="full",
+    pricing_profile="fixed",
+    sale_discount_percent=40,
+    delivered_context=None,
+):
+    """Reconstruit le payload complet accepté par updateListingInventory."""
+    if no_strap_policy not in {"full", "exclude", "half"}:
+        raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
+    if pricing_profile not in {"fixed", "kindle_sale_targets", "delivered_targets"}:
+        raise HTTPException(422, "Profil de prix invalide")
+    try:
+        discount = Decimal(str(sale_discount_percent))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Promotion invalide") from exc
+    if discount < 0 or discount >= 100:
+        raise HTTPException(422, "La promotion doit être comprise entre 0 et 99,99 %")
+    multiplier = (Decimal("100") - discount) / Decimal("100")
+    delivered_context = delivered_context or {}
+    delivered_config = delivered_context.get("config")
+    shipping_cost = delivered_context.get("shipping_cost")
+    shipping_source = delivered_context.get("shipping_source")
+    shipping_error = delivered_context.get("shipping_error")
+    baselines = delivered_context.get("baselines") or {}
+    promotion_source = delivered_context.get("promotion_source") or "non renseignée"
+    if pricing_profile == "delivered_targets" and delivered_config is None:
+        raise HTTPException(422, "Contexte des prix livrés manquant")
+    products = []
+    changes = []
+    for product_index, source_product in enumerate(inventory.get("products") or []):
+        product = {
+            "sku": source_product.get("sku") or "",
+            "property_values": [],
+            "offerings": [],
+        }
+        for source_property in source_product.get("property_values") or []:
+            property_value = {
+                key: source_property[key]
+                for key in ("property_id", "property_name", "scale_id", "value_ids", "values")
+                if source_property.get(key) is not None
+            }
+            product["property_values"].append(property_value)
+
+        variant = " · ".join(
+            "/".join(str(value) for value in (item.get("values") or []))
+            for item in product["property_values"]
+            if item.get("values")
+        ) or product["sku"] or f"Option {product_index + 1}"
+        model, style = _product_model_style(product["property_values"], product["sku"])
+        is_no_strap = _is_no_strap_variant(variant)
+        applied_adjustment = adjustment
+        pricing_rule = "Montant fixe"
+        matched = True
+        attraction_discounted_price = None
+        if is_no_strap and no_strap_policy == "exclude":
+            applied_adjustment = Decimal("0")
+        elif is_no_strap and no_strap_policy == "half":
+            applied_adjustment = (adjustment / Decimal("2")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        if pricing_profile == "kindle_sale_targets":
+            pricing_rule = _kindle_pricing_rule(variant) or "Non reconnue"
+            matched = pricing_rule != "Non reconnue"
+        elif pricing_profile == "delivered_targets":
+            attraction_discounted_price = _attraction_price_override(
+                model, style, delivered_config
+            )
+            if attraction_discounted_price is not None:
+                pricing_rule = "Prix d’attraction"
+                match_error = None
+                matched = True
+            else:
+                pricing_rule, match_error = _delivered_pricing_rule(model, style, delivered_config)
+                matched = pricing_rule is not None
+
+        for offering_index, source_offering in enumerate(source_product.get("offerings") or []):
+            baseline_key = _stable_baseline_key(product, offering_index)
+            old_price = _decimal_price(source_offering.get("price"))
+            old_discounted_price = (old_price * multiplier).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            status = "inchangé"
+            status_detail = None
+            delivered_target = None
+            baseline_discounted_price = None
+            current_total = None
+            proposed_total = None
+            target_gap = None
+            if pricing_profile == "kindle_sale_targets" and matched:
+                target_discounted_price = _kindle_discounted_target(
+                    pricing_rule, old_discounted_price
+                )
+                new_price = _base_price_for_discounted_target(
+                    target_discounted_price, multiplier
+                )
+                applied_adjustment = new_price - old_price
+            elif pricing_profile == "kindle_sale_targets":
+                target_discounted_price = old_discounted_price
+                new_price = old_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                applied_adjustment = Decimal("0")
+            elif pricing_profile == "delivered_targets":
+                baseline_discounted_price = baselines.get(baseline_key, old_discounted_price)
+                target_discounted_price = old_discounted_price
+                new_price = old_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                applied_adjustment = Decimal("0")
+                if shipping_cost is not None:
+                    current_total = (old_discounted_price + shipping_cost).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                if shipping_error:
+                    status = "à vérifier"
+                    status_detail = shipping_error
+                elif not matched:
+                    status = "à vérifier"
+                    status_detail = match_error
+                else:
+                    if attraction_discounted_price is not None and shipping_cost is not None:
+                        delivered_target = (
+                            attraction_discounted_price + shipping_cost
+                        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    elif attraction_discounted_price is not None:
+                        delivered_target = attraction_discounted_price
+                    else:
+                        delivered_target = delivered_config["targets"].get(pricing_rule)
+                    if delivered_target is None:
+                        status = "à vérifier"
+                        status_detail = "cible livrée absente"
+                    elif shipping_cost is None:
+                        status = "à vérifier"
+                        status_detail = "port France inconnu"
+                    elif shipping_cost >= delivered_target:
+                        status = "à vérifier"
+                        status_detail = "le port est supérieur ou égal à la cible livrée"
+                    else:
+                        proposed_discounted = (
+                            attraction_discounted_price
+                            if attraction_discounted_price is not None
+                            else (delivered_target - shipping_cost).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
+                        )
+                        if pricing_rule == "No strap":
+                            proposed_discounted = min(
+                                proposed_discounted,
+                                delivered_config["no_strap_cap"],
+                                baseline_discounted_price + delivered_config["no_strap_max_increase"],
+                            )
+                        candidate_price = _base_price_for_discounted_target(
+                            proposed_discounted,
+                            multiplier,
+                            prefer_lowest=attraction_discounted_price is not None,
+                        )
+                        if (
+                            attraction_discounted_price is None
+                            and
+                            not delivered_config["allow_price_decreases"]
+                            and candidate_price < old_price
+                        ):
+                            status = "déjà au-dessus de la cible"
+                            status_detail = "hausse uniquement : baisse non appliquée"
+                        else:
+                            new_price = candidate_price
+                            target_discounted_price = proposed_discounted
+                            applied_adjustment = new_price - old_price
+                            status = "modification" if new_price != old_price else "inchangé"
+                            if attraction_discounted_price is not None:
+                                status_detail = "prix d’attraction protégé"
+                        final_discounted = (new_price * multiplier).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        proposed_total = (final_discounted + shipping_cost).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        target_gap = (proposed_total - delivered_target).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        if pricing_rule == "No strap" and proposed_total < delivered_target:
+                            prefix = f"{status_detail} · " if status_detail else ""
+                            status_detail = prefix + "plafond d’appel No strap"
+            else:
+                new_price = (old_price + applied_adjustment).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                target_discounted_price = (new_price * multiplier).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            if old_price <= 0 or new_price <= 0:
+                raise HTTPException(422, f"Prix invalide pour {variant}: {new_price}")
+            offering = {
+                "price": float(new_price),
+                "quantity": source_offering.get("quantity", 0),
+                # Un prix d'attraction invisible ne peut pas remplir son rôle.
+                # L'override exact SY69JL + No strap implique donc sa disponibilité.
+                "is_enabled": (
+                    True if attraction_discounted_price is not None
+                    else bool(source_offering.get("is_enabled", True))
+                ),
+            }
+            if source_offering.get("readiness_state_id") is not None:
+                offering["readiness_state_id"] = source_offering["readiness_state_id"]
+            product["offerings"].append(offering)
+            changes.append({
+                "product_index": product_index,
+                "offering_index": offering_index,
+                "sku": product["sku"],
+                "variant": variant,
+                "model": model,
+                "style": style,
+                "enabled": offering["is_enabled"],
+                "is_no_strap": is_no_strap,
+                "pricing_rule": pricing_rule,
+                "matched": matched,
+                "applied_adjustment": float(applied_adjustment),
+                "old_price": float(old_price.quantize(Decimal("0.01"))),
+                "new_price": float(new_price),
+                "discounted_old_price": float(old_discounted_price),
+                "discounted_new_price": float(target_discounted_price),
+                "discounted_delta": float(target_discounted_price - old_discounted_price),
+                "promotion_percent": float(discount),
+                "promotion_source": promotion_source,
+                "shipping_cost": float(shipping_cost) if shipping_cost is not None else None,
+                "shipping_source": shipping_source,
+                "current_total": float(current_total) if current_total is not None else None,
+                "delivered_target": float(delivered_target) if delivered_target is not None else None,
+                "proposed_total": float(proposed_total) if proposed_total is not None else None,
+                "target_gap": float(target_gap) if target_gap is not None else None,
+                "baseline_key": baseline_key,
+                "baseline_discounted_price": (
+                    float(baseline_discounted_price)
+                    if baseline_discounted_price is not None else None
+                ),
+                "status": status,
+                "status_detail": status_detail,
+            })
+        products.append(product)
+
+    if not changes:
+        raise HTTPException(422, "Ce listing ne contient aucune option tarifaire modifiable")
+
+    payload = {"products": products}
+    for key in (
+        "price_on_property",
+        "quantity_on_property",
+        "sku_on_property",
+        "readiness_state_on_property",
+    ):
+        if inventory.get(key) is not None:
+            payload[key] = inventory[key]
+    return payload, changes
+
+
+_ROTATE_PLAIN_NAMES = {"rotate detach", "rotate and detach"}
+_ROTATE_STRAP_NAMES = {"rotate detach strap", "rotate and detach strap"}
+
+
+def _rotate_style_property(product):
+    """Retourne (index, type) pour les deux anciens libellés exacts."""
+    for index, item in enumerate(product.get("property_values") or []):
+        values = [_normalized_variant_name(value) for value in (item.get("values") or [])]
+        if any(value in _ROTATE_STRAP_NAMES for value in values):
+            return index, "strap"
+        if any(value in _ROTATE_PLAIN_NAMES for value in values):
+            return index, "plain"
+    return None, None
+
+
+def _rotate_product_group(product, style_index):
+    """Identité de toutes les dimensions sauf Style, indépendante des IDs Etsy."""
+    values = []
+    for index, item in enumerate(product.get("property_values") or []):
+        if index == style_index:
+            continue
+        values.append((
+            item.get("property_id"),
+            _normalized_variant_name(item.get("property_name") or ""),
+            tuple(sorted(_normalized_variant_name(value) for value in (item.get("values") or []))),
+        ))
+    return tuple(sorted(values, key=lambda item: (str(item[0]), item[1], item[2])))
+
+
+def _offering_merge_signature(product):
+    return [(
+        offering.get("quantity", 0),
+        offering.get("readiness_state_id"),
+    ) for offering in (product.get("offerings") or [])]
+
+
+def _semantic_inventory_fingerprint(inventory):
+    """Empreinte logique tolérant seulement la réattribution d'un value_id par Etsy."""
+    products = []
+    for product in inventory.get("products") or []:
+        properties = sorted((
+            item.get("property_id"),
+            _normalized_variant_name(item.get("property_name") or ""),
+            tuple(sorted(_normalized_variant_name(value) for value in (item.get("values") or []))),
+        ) for item in (product.get("property_values") or []))
+        offerings = []
+        for offering in product.get("offerings") or []:
+            offerings.append({
+                "price": str(_decimal_price(offering.get("price")).quantize(Decimal("0.01"))),
+                "quantity": offering.get("quantity", 0),
+                "is_enabled": bool(offering.get("is_enabled", True)),
+                "readiness_state_id": offering.get("readiness_state_id"),
+            })
+        products.append({
+            "sku": product.get("sku") or "",
+            "properties": properties,
+            "offerings": offerings,
+        })
+    products.sort(key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
+    root = {
+        "products": products,
+        "price_on_property": inventory.get("price_on_property") or [],
+        "quantity_on_property": inventory.get("quantity_on_property") or [],
+        "sku_on_property": inventory.get("sku_on_property") or [],
+        "readiness_state_on_property": inventory.get("readiness_state_on_property") or [],
+    }
+    return _inventory_fingerprint(root)
+
+
+def _device_property_index(product):
+    """Return the single property that represents the reader/device model."""
+    matches = []
+    for index, item in enumerate(product.get("property_values") or []):
+        name = _normalized_variant_name(item.get("property_name") or "")
+        if any(token in name for token in ("device", "model", "kindle", "kobo", "reader")):
+            matches.append(index)
+    if len(matches) > 1:
+        raise HTTPException(422, "Plusieurs propriétés Device ambiguës dans un produit")
+    return matches[0] if matches else None
+
+
+def _device_value(product):
+    index = _device_property_index(product)
+    if index is None:
+        return None
+    values = product["property_values"][index].get("values") or []
+    return " / ".join(str(value).strip() for value in values if str(value).strip())
+
+
+def _device_combination_signature(product):
+    """Identify a product by every variation except Device."""
+    device_index = _device_property_index(product)
+    values = []
+    for index, item in enumerate(product.get("property_values") or []):
+        if index == device_index:
+            continue
+        values.append((
+            item.get("property_id"),
+            _normalized_variant_name(item.get("property_name") or ""),
+            tuple(sorted(_normalized_variant_name(value) for value in (item.get("values") or []))),
+        ))
+    return tuple(sorted(values, key=lambda item: (str(item[0]), item[1], item[2])))
+
+
+def _canonical_device_style(style):
+    return _kindle_pricing_rule(style) or _normalized_variant_name(style)
+
+
+def _parse_device_styles(raw_styles):
+    if raw_styles in (None, "", []):
+        return []
+    try:
+        styles = json.loads(raw_styles) if isinstance(raw_styles, str) else list(raw_styles)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "Liste de styles Device invalide") from exc
+    if not isinstance(styles, list):
+        raise HTTPException(422, "La liste de styles Device doit être un tableau")
+    cleaned = [str(style).strip() for style in styles if str(style).strip()]
+    if len({_canonical_device_style(style) for style in cleaned}) != len(cleaned):
+        raise HTTPException(422, "La liste de styles Device contient des doublons")
+    return cleaned
+
+
+def _add_device_option_payload(inventory, source_device, new_device, included_styles=None):
+    """Clone all combinations of one Device value under a new Device value."""
+    clean, _changes = _clean_inventory_payload(inventory, Decimal("0"))
+    source_key = _normalized_variant_name(source_device)
+    new_key = _normalized_variant_name(new_device)
+    if not source_key or not new_key:
+        raise HTTPException(422, "Le Device source et le nouveau Device sont obligatoires")
+    if source_key == new_key:
+        raise HTTPException(422, "Le nouveau Device doit être différent du Device source")
+
+    all_source_products = [
+        product for product in clean.get("products") or []
+        if _normalized_variant_name(_device_value(product)) == source_key
+    ]
+    if not all_source_products:
+        raise HTTPException(422, f"Device source introuvable : {source_device}")
+
+    included_styles = _parse_device_styles(included_styles)
+    selected_style_keys = {_canonical_device_style(style) for style in included_styles}
+    source_products = []
+    found_style_keys = set()
+    for product in all_source_products:
+        _model, style = _product_model_style(
+            product.get("property_values"), product.get("sku")
+        )
+        style_key = _canonical_device_style(style)
+        if not selected_style_keys or style_key in selected_style_keys:
+            source_products.append(product)
+            found_style_keys.add(style_key)
+    missing_styles = selected_style_keys - found_style_keys
+    if missing_styles:
+        missing_labels = [
+            style for style in included_styles
+            if _canonical_device_style(style) in missing_styles
+        ]
+        raise HTTPException(
+            422,
+            "Styles absents du Device source : " + ", ".join(missing_labels),
+        )
+
+    target_products = [
+        product for product in clean.get("products") or []
+        if _normalized_variant_name(_device_value(product)) == new_key
+    ]
+    source_signatures = sorted(repr(_device_combination_signature(item)) for item in source_products)
+    target_signatures = sorted(repr(_device_combination_signature(item)) for item in target_products)
+    if target_products:
+        if target_signatures != source_signatures:
+            raise HTTPException(
+                422,
+                f"Le Device {new_device} existe partiellement ou avec des combinaisons différentes",
+            )
+        return clean, [], {
+            "affected": False,
+            "already_exists": True,
+            "count_added": 0,
+            "count_products_before": len(clean["products"]),
+            "count_products_after": len(clean["products"]),
+            "included_styles": included_styles,
+        }
+
+    additions = []
+    changes = []
+    for source_product in source_products:
+        cloned = json.loads(json.dumps(source_product, ensure_ascii=False))
+        device_index = _device_property_index(cloned)
+        if device_index is None:
+            raise HTTPException(422, "Produit source sans propriété Device")
+        device_property = cloned["property_values"][device_index]
+        device_property["values"] = [str(new_device).strip()]
+        device_property["value_ids"] = []
+        additions.append(cloned)
+        _model, style = _product_model_style(cloned.get("property_values"), cloned.get("sku"))
+        changes.append({
+            "source_device": str(source_device).strip(),
+            "new_device": str(new_device).strip(),
+            "style": style,
+            "sku": cloned.get("sku") or "",
+            "count_offerings": len(cloned.get("offerings") or []),
+        })
+
+    before = len(clean["products"])
+    clean["products"].extend(additions)
+    return clean, changes, {
+        "affected": True,
+        "already_exists": False,
+        "count_added": len(additions),
+        "count_products_before": before,
+        "count_products_after": len(clean["products"]),
+        "included_styles": included_styles,
+    }
+
+
+def _count_inventory_offerings(inventory):
+    return sum(len(product.get("offerings") or []) for product in inventory.get("products") or [])
+
+
+def _audit_rotate_inventory(inventory, shipping_cost, sale_discount_percent, delivered_target):
+    """Compte anciens noms, doublons et totaux livrés incorrects."""
+    discount = Decimal(str(sale_discount_percent))
+    multiplier = (Decimal("100") - discount) / Decimal("100")
+    target = Decimal(str(delivered_target)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    groups = {}
+    legacy_count = 0
+    plain_offerings = 0
+    wrong_totals = 0
+    for product in inventory.get("products") or []:
+        style_index, kind = _rotate_style_property(product)
+        if not kind:
+            continue
+        group = _rotate_product_group(product, style_index)
+        groups.setdefault(group, []).append(kind)
+        if kind == "strap":
+            legacy_count += 1
+            continue
+        for offering in product.get("offerings") or []:
+            plain_offerings += 1
+            if shipping_cost is None:
+                wrong_totals += 1
+                continue
+            delivered = (
+                (_decimal_price(offering.get("price")) * multiplier).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                + Decimal(str(shipping_cost))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if delivered != target:
+                wrong_totals += 1
+    duplicate_count = sum(max(0, kinds.count("plain") - 1) for kinds in groups.values())
+    return {
+        "count_legacy_remaining": legacy_count,
+        "count_plain_rotate_offerings": plain_offerings,
+        "count_duplicate_plain": duplicate_count,
+        "count_wrong_delivered_total": wrong_totals,
+    }
+
+
+def _assert_attraction_anchor(inventory, multiplier):
+    """Le prix d'appel exact SY69JL + No strap ne doit jamais dériver."""
+    matches = []
+    for product in inventory.get("products") or []:
+        model, style = _product_model_style(product.get("property_values") or [], product.get("sku"))
+        if (
+            _normalized_variant_name(model) == "sy69jl"
+            and _normalized_variant_name(style) == "no strap"
+        ):
+            for offering in product.get("offerings") or []:
+                discounted = (_decimal_price(offering.get("price")) * multiplier).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                matches.append(discounted)
+    if matches and any(value != Decimal("13.33") for value in matches):
+        raise HTTPException(
+            422,
+            "Protection SY69JL + No strap invalide : le prix remisé doit rester exactement à 13,33 EUR",
+        )
+    return len(matches)
+
+
+def _normalize_rotate_inventory(inventory, shipping_cost, sale_discount_percent, delivered_target):
+    """Construit l'inventaire complet canonique sans jamais modifier l'entrée source."""
+    clean, _changes = _clean_inventory_payload(inventory, Decimal("0"))
+    try:
+        discount = Decimal(str(sale_discount_percent))
+        target = Decimal(str(delivered_target)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Promotion ou cible livrée invalide") from exc
+    if discount < 0 or discount >= 100:
+        raise HTTPException(422, "La promotion doit être comprise entre 0 et 99,99 %")
+    multiplier = (Decimal("100") - discount) / Decimal("100")
+    _assert_attraction_anchor(clean, multiplier)
+
+    indexed = {}
+    affected = []
+    for index, product in enumerate(clean.get("products") or []):
+        style_index, kind = _rotate_style_property(product)
+        if kind:
+            key = _rotate_product_group(product, style_index)
+            indexed.setdefault(key, {}).setdefault(kind, []).append((index, style_index))
+            if kind == "strap":
+                affected.append(index)
+    if not affected:
+        return clean, [], {
+            "affected": False, "count_renamed": 0, "count_merged": 0,
+            "count_removed": 0, "count_enabled_promoted": 0,
+        }
+    if shipping_cost is None:
+        raise HTTPException(422, "Port France inconnu : normalisation impossible")
+    discounted_item_target = (target - Decimal(str(shipping_cost))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    if discounted_item_target <= 0:
+        raise HTTPException(422, "Le port France est supérieur ou égal à la cible livrée")
+    catalog_target = _base_price_for_discounted_target(discounted_item_target, multiplier)
+
+    remove_indexes = set()
+    changes = []
+    counts = {
+        "affected": True, "count_renamed": 0, "count_merged": 0,
+        "count_removed": 0, "count_enabled_promoted": 0,
+    }
+    for key, variants in indexed.items():
+        straps = variants.get("strap") or []
+        plains = variants.get("plain") or []
+        if len(straps) > 1 or len(plains) > 1:
+            raise HTTPException(422, "Doublon Rotate&Detach ambigu : fusion sans perte impossible")
+        if not straps:
+            continue
+        strap_index, strap_style_index = straps[0]
+        strap_product = clean["products"][strap_index]
+        if plains:
+            plain_index, _plain_style_index = plains[0]
+            plain_product = clean["products"][plain_index]
+            if (plain_product.get("sku") or "") != (strap_product.get("sku") or ""):
+                raise HTTPException(422, "SKU différents entre Rotate&Detach et +Strap")
+            if _offering_merge_signature(plain_product) != _offering_merge_signature(strap_product):
+                raise HTTPException(422, "Quantité ou profil de préparation différent : fusion bloquée")
+            if len(plain_product.get("offerings") or []) != len(strap_product.get("offerings") or []):
+                raise HTTPException(422, "Nombre d'offres différent : fusion bloquée")
+            for plain_offering, strap_offering in zip(
+                plain_product.get("offerings") or [], strap_product.get("offerings") or []
+            ):
+                promoted = bool(strap_offering.get("is_enabled")) and not bool(plain_offering.get("is_enabled"))
+                plain_offering["is_enabled"] = bool(
+                    plain_offering.get("is_enabled") or strap_offering.get("is_enabled")
+                )
+                plain_offering["price"] = float(catalog_target)
+                if promoted:
+                    counts["count_enabled_promoted"] += 1
+            remove_indexes.add(strap_index)
+            counts["count_merged"] += 1
+            counts["count_removed"] += 1
+            action = "fusion"
+        else:
+            style_property = strap_product["property_values"][strap_style_index]
+            style_property["values"] = ["Rotate&Detach"]
+            style_property["value_ids"] = []
+            for offering in strap_product.get("offerings") or []:
+                offering["price"] = float(catalog_target)
+            counts["count_renamed"] += 1
+            action = "renommage"
+        changes.append({
+            "group": repr(key),
+            "action": action,
+            "catalog_price": float(catalog_target),
+            "discounted_item_price": float(discounted_item_target),
+            "shipping_cost": float(shipping_cost),
+            "delivered_total": float(target),
+        })
+    clean["products"] = [
+        product for index, product in enumerate(clean["products"]) if index not in remove_indexes
+    ]
+    seen_plain = set()
+    for product in clean["products"]:
+        style_index, kind = _rotate_style_property(product)
+        if kind == "strap":
+            raise HTTPException(500, "Invariant interne : +Strap encore présent")
+        if kind == "plain":
+            group = _rotate_product_group(product, style_index)
+            if group in seen_plain:
+                raise HTTPException(422, "Doublon Rotate&Detach restant après fusion")
+            seen_plain.add(group)
+    return clean, changes, counts
+
+
+def normalize_rotate_detach_listing(
+    listing_id,
+    apply=False,
+    sale_discount_percent=None,
+    delivered_target=29.99,
+    promotion_source=None,
+    expected_inventory_sha256=None,
+    expected_pricing_context_sha256=None,
+):
+    """Aperçoit/applique atomiquement la migration +Strap d'un listing."""
+    if sale_discount_percent is None or not promotion_source:
+        raise HTTPException(422, "Promotion vérifiée et sa source obligatoires")
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if apply and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(409, "L'inventaire Etsy a changé depuis l'aperçu")
+
+    has_rotate = any(_rotate_style_property(product)[1] for product in backup_payload["products"])
+    has_legacy = any(_rotate_style_property(product)[1] == "strap" for product in backup_payload["products"])
+    shipping_profile = _get_listing_shipping_profile(listing_id) if has_rotate else None
+    shipping_cost, shipping_source, shipping_error = _fr_primary_shipping(shipping_profile, "EUR") \
+        if has_rotate else (None, None, None)
+    if has_rotate and shipping_error:
+        raise HTTPException(422, shipping_error)
+    context = {
+        "shipping_profile": shipping_profile,
+        "sale_discount_percent": str(sale_discount_percent),
+        "promotion_source": str(promotion_source),
+        "delivered_target": str(delivered_target),
+        "operation": "normalize_rotate_detach_v1",
+    }
+    pricing_context_sha256 = _inventory_fingerprint(context)
+    if apply and expected_pricing_context_sha256 != pricing_context_sha256:
+        raise HTTPException(409, "Le port, la promotion ou la cible ont changé depuis l'aperçu")
+    payload, changes, counts = _normalize_rotate_inventory(
+        inventory, shipping_cost, sale_discount_percent, delivered_target
+    )
+    audit = _audit_rotate_inventory(
+        payload, shipping_cost, sale_discount_percent, delivered_target
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "verified": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": "EUR",
+        "operation": "normalize_rotate_detach",
+        "pricing_profile": "rotate_detach_normalization",
+        "sale_discount_percent": float(Decimal(str(sale_discount_percent))),
+        "promotion_source": promotion_source,
+        "delivered_target": float(Decimal(str(delivered_target))),
+        "inventory_sha256": inventory_sha256,
+        "pricing_context_sha256": pricing_context_sha256,
+        "shipping_profile": shipping_profile,
+        "shipping_cost": float(shipping_cost) if shipping_cost is not None else None,
+        "shipping_source": shipping_source,
+        "count_prices": _count_inventory_offerings(backup_payload),
+        "count_products_before": len(backup_payload["products"]),
+        "count_products_after": len(payload["products"]),
+        "changes": changes,
+        "backup_payload": backup_payload,
+        **counts,
+        **audit,
+    }
+    if not apply or not counts["affected"]:
+        return result
+    expected_semantic = _semantic_inventory_fingerprint(payload)
+    update_response, update_data = etsy_request(
+        "PUT", f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"}, json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Normalisation Rotate&Detach")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(verify_response, verified_inventory, "Vérification de la normalisation")
+    try:
+        verified_clean, _ = _clean_inventory_payload(verified_inventory, Decimal("0"))
+        _assert_attraction_anchor(
+            verified_clean,
+            (Decimal("100") - Decimal(str(sale_discount_percent))) / Decimal("100"),
+        )
+        if _semantic_inventory_fingerprint(verified_clean) != expected_semantic:
+            raise ValueError("inventaire relu différent")
+        if any(_rotate_style_property(product)[1] == "strap" for product in verified_clean["products"]):
+            raise ValueError("ancien libellé encore présent")
+        verified_audit = _audit_rotate_inventory(
+            verified_clean, shipping_cost, sale_discount_percent, delivered_target
+        )
+        if any(verified_audit[key] for key in (
+            "count_legacy_remaining", "count_duplicate_plain", "count_wrong_delivered_total"
+        )):
+            raise ValueError(f"audit final non conforme : {verified_audit}")
+    except Exception as verification_error:
+        rollback_response, rollback_data = etsy_request(
+            "PUT", f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"}, json_data=backup_payload,
+        )
+        require_etsy_success(rollback_response, rollback_data, "Restauration automatique")
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(rollback_verify_response, rollback_inventory, "Vérification de la restauration")
+        rollback_clean, _ = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(rollback_clean) != _semantic_inventory_fingerprint(backup_payload):
+            raise HTTPException(502, "ÉCHEC CRITIQUE : normalisation et restauration non vérifiées")
+        raise HTTPException(
+            502,
+            f"Normalisation non vérifiée; inventaire initial restauré ({verification_error})",
+        )
+    result.update({"applied": True, "verified": True})
+    return result
+
+
+def add_device_option_listing(
+    listing_id,
+    source_device,
+    new_device,
+    included_styles=None,
+    apply=False,
+    expected_inventory_sha256=None,
+    expected_operation_sha256=None,
+):
+    """Preview or atomically add a Device value by cloning a reference value."""
+    source_device = str(source_device or "").strip()
+    new_device = str(new_device or "").strip()
+    included_styles = _parse_device_styles(included_styles)
+    if not source_device or not new_device:
+        raise HTTPException(422, "Le Device source et le nouveau Device sont obligatoires")
+
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if apply and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(409, "L'inventaire Etsy a changé depuis l'aperçu")
+
+    operation_context = {
+        "operation": "add_device_option_v1",
+        "source_device": source_device,
+        "new_device": new_device,
+        "included_styles": included_styles,
+    }
+    operation_sha256 = _inventory_fingerprint(operation_context)
+    if apply and expected_operation_sha256 != operation_sha256:
+        raise HTTPException(409, "Le Device source ou le nouveau Device a changé depuis l'aperçu")
+
+    payload, changes, counts = _add_device_option_payload(
+        inventory, source_device, new_device, included_styles
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "verified": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": "EUR",
+        "operation": "add_device_option",
+        "pricing_profile": "device_option_clone",
+        "source_device": source_device,
+        "new_device": new_device,
+        "included_styles": included_styles,
+        "inventory_sha256": inventory_sha256,
+        "operation_sha256": operation_sha256,
+        "pricing_context_sha256": operation_sha256,
+        "count_prices": _count_inventory_offerings(backup_payload),
+        "changes": changes,
+        "backup_payload": backup_payload,
+        **counts,
+    }
+    if not apply or not counts["affected"]:
+        return result
+
+    expected_semantic = _semantic_inventory_fingerprint(payload)
+    update_response, update_data = etsy_request(
+        "PUT", f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"}, json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Ajout du nouveau Device")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request(
+        "GET", f"/listings/{listing_id}/inventory"
+    )
+    require_etsy_success(verify_response, verified_inventory, "Vérification du nouveau Device")
+    try:
+        verified_clean, _ = _clean_inventory_payload(verified_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(verified_clean) != expected_semantic:
+            raise ValueError("inventaire relu différent")
+        _verified_payload, _verified_changes, verified_counts = _add_device_option_payload(
+            verified_inventory, source_device, new_device, included_styles
+        )
+        if not verified_counts["already_exists"]:
+            raise ValueError("le nouveau Device n'est pas complet après relecture")
+    except Exception as verification_error:
+        rollback_response, rollback_data = etsy_request(
+            "PUT", f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"}, json_data=backup_payload,
+        )
+        require_etsy_success(rollback_response, rollback_data, "Restauration automatique")
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(
+            rollback_verify_response, rollback_inventory, "Vérification de la restauration"
+        )
+        rollback_clean, _ = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(rollback_clean) != _semantic_inventory_fingerprint(backup_payload):
+            raise HTTPException(502, "ÉCHEC CRITIQUE : ajout et restauration non vérifiés")
+        raise HTTPException(
+            502,
+            f"Ajout non vérifié; inventaire initial restauré ({verification_error})",
+        )
+    result.update({"applied": True, "verified": True})
+    return result
+
+
+def _ensure_attraction_anchor_payload(inventory, sale_discount_percent=40):
+    """Réactive seulement SY69JL + No strap et garantit 13,33 EUR remisé."""
+    clean, _changes = _clean_inventory_payload(inventory, Decimal("0"))
+    try:
+        discount = Decimal(str(sale_discount_percent))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Promotion invalide") from exc
+    if discount < 0 or discount >= 100:
+        raise HTTPException(422, "La promotion doit être comprise entre 0 et 99,99 %")
+    multiplier = (Decimal("100") - discount) / Decimal("100")
+    catalog_price = _base_price_for_discounted_target(
+        Decimal("13.33"), multiplier, prefer_lowest=True
+    )
+    changes = []
+    matches = 0
+    for product_index, product in enumerate(clean.get("products") or []):
+        model, style = _product_model_style(
+            product.get("property_values") or [], product.get("sku")
+        )
+        if (
+            _normalized_variant_name(model) != "sy69jl"
+            or _normalized_variant_name(style) != "no strap"
+        ):
+            continue
+        for offering_index, offering in enumerate(product.get("offerings") or []):
+            matches += 1
+            old_price = _decimal_price(offering.get("price")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            was_enabled = bool(offering.get("is_enabled", True))
+            offering["price"] = float(catalog_price)
+            offering["is_enabled"] = True
+            changes.append({
+                "product_index": product_index,
+                "offering_index": offering_index,
+                "sku": product.get("sku") or "",
+                "old_price": float(old_price),
+                "new_price": float(catalog_price),
+                "was_enabled": was_enabled,
+                "is_enabled": True,
+                "discounted_price": 13.33,
+                "changed": old_price != catalog_price or not was_enabled,
+            })
+    return clean, changes, {
+        "anchor_found": matches > 0,
+        "anchor_count": matches,
+        "count_changed": sum(change["changed"] for change in changes),
+        "count_reenabled": sum(not change["was_enabled"] for change in changes),
+    }
+
+
+def ensure_attraction_anchor_listing(
+    listing_id,
+    apply=False,
+    sale_discount_percent=None,
+    promotion_source=None,
+    expected_inventory_sha256=None,
+    expected_pricing_context_sha256=None,
+):
+    """Aperçoit/applique la disponibilité du prix d'appel sans autre changement."""
+    if sale_discount_percent is None or not promotion_source:
+        raise HTTPException(422, "Promotion vérifiée et sa source obligatoires")
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    backup_payload, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if apply and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(409, "L'inventaire Etsy a changé depuis l'aperçu")
+    context = {
+        "sale_discount_percent": str(sale_discount_percent),
+        "promotion_source": str(promotion_source),
+        "model": "SY69JL",
+        "style": "No strap",
+        "discounted_price": "13.33",
+        "operation": "ensure_attraction_anchor_v1",
+    }
+    pricing_context_sha256 = _inventory_fingerprint(context)
+    if apply and expected_pricing_context_sha256 != pricing_context_sha256:
+        raise HTTPException(409, "La promotion ou la règle d'attraction a changé depuis l'aperçu")
+    payload, changes, counts = _ensure_attraction_anchor_payload(
+        inventory, sale_discount_percent
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "verified": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": "EUR",
+        "operation": "ensure_attraction_anchor",
+        "pricing_profile": "attraction_anchor",
+        "sale_discount_percent": float(Decimal(str(sale_discount_percent))),
+        "promotion_source": promotion_source,
+        "inventory_sha256": inventory_sha256,
+        "pricing_context_sha256": pricing_context_sha256,
+        "shipping_profile": None,
+        "count_prices": _count_inventory_offerings(backup_payload),
+        "changes": changes,
+        "backup_payload": backup_payload,
+        **counts,
+    }
+    if not apply or not counts["count_changed"]:
+        return result
+    expected_semantic = _semantic_inventory_fingerprint(payload)
+    update_response, update_data = etsy_request(
+        "PUT", f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"}, json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Activation du prix d'attraction")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request(
+        "GET", f"/listings/{listing_id}/inventory"
+    )
+    require_etsy_success(verify_response, verified_inventory, "Vérification du prix d'attraction")
+    try:
+        verified_clean, verified_changes, verified_counts = _ensure_attraction_anchor_payload(
+            verified_inventory, sale_discount_percent
+        )
+        if _semantic_inventory_fingerprint(verified_clean) != expected_semantic:
+            raise ValueError("inventaire relu différent")
+        if not verified_counts["anchor_found"] or verified_counts["count_changed"]:
+            raise ValueError("prix d'attraction absent, désactivé ou incorrect")
+        if any(not change["is_enabled"] or change["discounted_price"] != 13.33 for change in verified_changes):
+            raise ValueError("protection du prix d'attraction non vérifiée")
+    except Exception as verification_error:
+        rollback_response, rollback_data = etsy_request(
+            "PUT", f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"}, json_data=backup_payload,
+        )
+        require_etsy_success(rollback_response, rollback_data, "Restauration automatique")
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(rollback_verify_response, rollback_inventory, "Vérification de la restauration")
+        rollback_clean, _ = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if _semantic_inventory_fingerprint(rollback_clean) != _semantic_inventory_fingerprint(backup_payload):
+            raise HTTPException(502, "ÉCHEC CRITIQUE : activation et restauration non vérifiées")
+        raise HTTPException(
+            502,
+            f"Activation non vérifiée; inventaire initial restauré ({verification_error})",
+        )
+    result.update({"applied": True, "verified": True})
+    return result
+
+
+def listing_price_adjustment(
+    listing_id,
+    amount,
+    apply=False,
+    no_strap_policy="full",
+    expected_inventory_sha256=None,
+    pricing_profile="fixed",
+    sale_discount_percent=None,
+    delivered_targets_json=None,
+    discounted_baselines_json=None,
+    expected_pricing_context_sha256=None,
+    promotion_source=None,
+):
+    """Prévisualise ou applique un montant fixe à chaque offering d'un listing."""
+    try:
+        adjustment = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(422, "Montant invalide") from exc
+    if pricing_profile == "delivered_targets" and sale_discount_percent is None:
+        raise HTTPException(422, "Le taux de promotion vérifié est obligatoire")
+    if sale_discount_percent is None:
+        sale_discount_percent = 40
+    if pricing_profile == "fixed" and (adjustment == 0 or abs(adjustment) > Decimal("1000")):
+        raise HTTPException(422, "Le montant doit être non nul et compris entre -1000 et 1000")
+    if pricing_profile not in {"fixed", "kindle_sale_targets", "delivered_targets"}:
+        raise HTTPException(422, "Profil de prix invalide")
+    if pricing_profile == "delivered_targets" and not promotion_source:
+        raise HTTPException(422, "La source du taux de promotion vérifié est obligatoire")
+    if no_strap_policy not in {"full", "exclude", "half"}:
+        raise HTTPException(422, "Politique No strap invalide : full, exclude ou half")
+
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    currency = next(
+        (
+            offering.get("price", {}).get("currency_code")
+            for product in inventory.get("products") or []
+            for offering in product.get("offerings") or []
+            if isinstance(offering.get("price"), dict)
+            and offering.get("price", {}).get("currency_code")
+        ),
+        None,
+    )
+    delivered_context = None
+    pricing_context_sha256 = None
+    shipping_profile = None
+    if pricing_profile == "delivered_targets":
+        delivered_config = _parse_delivered_targets(delivered_targets_json)
+        if delivered_config["market"] != "FR" or delivered_config["currency"] != "EUR":
+            raise HTTPException(422, "Ce mode est limité au marché FR en EUR")
+        if delivered_config["quantity"] != 1:
+            raise HTTPException(422, "Ce mode exige une quantité de référence égale à 1")
+        if currency and str(currency).upper() != delivered_config["currency"]:
+            raise HTTPException(422, f"Devise du listing incompatible : {currency}")
+        baselines = _parse_discounted_baselines(discounted_baselines_json)
+        shipping_profile = _get_listing_shipping_profile(listing_id)
+        shipping_cost, shipping_source, shipping_error = _fr_primary_shipping(
+            shipping_profile, delivered_config["currency"]
+        )
+        context_payload = {
+            "shipping_profile": shipping_profile,
+            "promotion_percent": str(sale_discount_percent),
+            "promotion_source": str(promotion_source),
+            "targets": json.loads(delivered_targets_json),
+            "baselines": {key: str(value) for key, value in sorted(baselines.items())},
+        }
+        pricing_context_sha256 = _inventory_fingerprint(context_payload)
+        if apply and expected_pricing_context_sha256 != pricing_context_sha256:
+            raise HTTPException(
+                409,
+                "Le port, la promotion, les cibles ou la référence No strap ont changé depuis l’aperçu",
+            )
+        delivered_context = {
+            "config": delivered_config,
+            "shipping_cost": shipping_cost,
+            "shipping_source": shipping_source,
+            "shipping_error": shipping_error,
+            "baselines": baselines,
+            "promotion_source": promotion_source,
+        }
+    backup_payload, backup_changes = _clean_inventory_payload(inventory, Decimal("0"))
+    inventory_sha256 = _inventory_fingerprint(backup_payload)
+    if pricing_profile == "delivered_targets" and apply and not expected_inventory_sha256:
+        raise HTTPException(422, "L’empreinte d’inventaire de l’aperçu est obligatoire")
+    if apply and expected_inventory_sha256 and expected_inventory_sha256 != inventory_sha256:
+        raise HTTPException(
+            409,
+            "L’inventaire Etsy a changé depuis l’aperçu; aucune modification n’a été appliquée",
+        )
+    payload, changes = _clean_inventory_payload(
+        inventory,
+        adjustment,
+        no_strap_policy,
+        pricing_profile,
+        sale_discount_percent,
+        delivered_context,
+    )
+    result = {
+        "success": True,
+        "applied": False,
+        "listing_id": listing_id,
+        "title": listing.get("title"),
+        "state": listing.get("state"),
+        "currency": currency,
+        "adjustment": float(adjustment),
+        "no_strap_policy": no_strap_policy,
+        "pricing_profile": pricing_profile,
+        "sale_discount_percent": float(Decimal(str(sale_discount_percent))),
+        "count_prices": len(changes),
+        "count_changed": sum(change["old_price"] != change["new_price"] for change in changes),
+        "count_no_strap": sum(change["is_no_strap"] for change in changes),
+        "count_unmatched": sum(not change["matched"] for change in changes),
+        "count_review": sum(change.get("status") == "à vérifier" for change in changes),
+        "count_above_target": sum(
+            change.get("status") == "déjà au-dessus de la cible" for change in changes
+        ),
+        "inventory_sha256": inventory_sha256,
+        "pricing_context_sha256": pricing_context_sha256,
+        "shipping_profile": shipping_profile,
+        "count_enabled": sum(1 for change in changes if change["enabled"]),
+        "changes": changes,
+        "backup_payload": backup_payload,
+    }
+    if not apply:
+        return result
+    if pricing_profile == "kindle_sale_targets" and result["count_unmatched"]:
+        raise HTTPException(
+            422,
+            "Certaines variantes ne correspondent à aucune règle; aucune modification appliquée",
+        )
+
+    update_response, update_data = etsy_request(
+        "PUT",
+        f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"},
+        json_data=payload,
+    )
+    require_etsy_success(update_response, update_data, "Mise à jour des prix")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(verify_response, verified_inventory, "Vérification des nouveaux prix")
+    _, verified_changes = _clean_inventory_payload(verified_inventory, Decimal("0"))
+    actual_prices = [change["old_price"] for change in verified_changes]
+    expected_prices = [change["new_price"] for change in changes]
+    if actual_prices != expected_prices:
+        rollback_response, rollback_data = etsy_request(
+            "PUT",
+            f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"},
+            json_data=backup_payload,
+        )
+        require_etsy_success(
+            rollback_response,
+            rollback_data,
+            "Restauration automatique après échec de vérification",
+        )
+        rollback_verify_response, rollback_inventory = etsy_request(
+            "GET", f"/listings/{listing_id}/inventory"
+        )
+        require_etsy_success(
+            rollback_verify_response,
+            rollback_inventory,
+            "Vérification de la restauration automatique",
+        )
+        _, rollback_changes = _clean_inventory_payload(rollback_inventory, Decimal("0"))
+        if [change["old_price"] for change in rollback_changes] != [
+            change["old_price"] for change in backup_changes
+        ]:
+            raise HTTPException(502, "ÉCHEC CRITIQUE : mise à jour et restauration non vérifiées")
+        raise HTTPException(
+            502,
+            "La vérification a échoué; les prix d’origine ont été restaurés et vérifiés",
+        )
+    result.update({"applied": True, "verified": True})
+    return result
+
+
+def listing_price_catalog():
+    """Liste les listings actifs et sauvegarde aussi leurs profils de livraison."""
+    shop_id = get_shop_id_for_user()
+    listings = []
+    offset = 0
+    page_size = 100
+    while True:
+        response, data = etsy_request(
+            "GET",
+            f"/shops/{shop_id}/listings",
+            params={"state": "active", "limit": page_size, "offset": offset},
+        )
+        require_etsy_success(response, data, "Récupération des listings actifs")
+        results = data.get("results") or []
+        listings.extend({
+            "listing_id": item.get("listing_id"),
+            "title": item.get("title"),
+            "state": item.get("state"),
+        } for item in results if item.get("listing_id") is not None)
+        if len(results) < page_size:
+            break
+        offset += page_size
+    shipping_by_listing = {}
+    listing_ids = [item["listing_id"] for item in listings]
+    for start in range(0, len(listing_ids), 100):
+        batch = listing_ids[start:start + 100]
+        response, data = etsy_request(
+            "GET",
+            "/listings/batch/shipping",
+            params={"listing_ids": ",".join(str(item) for item in batch)},
+        )
+        require_etsy_success(response, data, "Récupération des profils de livraison")
+        for item in data.get("results") or []:
+            if item.get("listing_id") is not None:
+                shipping_by_listing[int(item["listing_id"])] = item.get("shipping_profile")
+    for item in listings:
+        item["shipping_profile"] = shipping_by_listing.get(int(item["listing_id"]))
+    return {"success": True, "count": len(listings), "listings": listings}
+
+
+def restore_listing_inventory(listing_id, backup_payload):
+    """Restaure un inventaire sauvegardé puis vérifie chaque prix relu sur Etsy."""
+    if not isinstance(backup_payload, dict):
+        raise HTTPException(422, "Sauvegarde d’inventaire invalide")
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request("GET", f"/listings/{listing_id}")
+    require_etsy_success(listing_response, listing, "Récupération du listing")
+    if listing.get("shop_id") and int(listing["shop_id"]) != int(shop_id):
+        raise HTTPException(403, "Ce listing n'appartient pas à la boutique autorisée")
+
+    clean_payload, expected_changes = _clean_inventory_payload(
+        backup_payload, Decimal("0")
+    )
+    update_response, update_data = etsy_request(
+        "PUT",
+        f"/listings/{listing_id}/inventory",
+        params={"max_variations_supported": "3"},
+        json_data=clean_payload,
+    )
+    require_etsy_success(update_response, update_data, "Restauration de l’inventaire")
+    _INVENTORY_CACHE.pop(listing_id, None)
+    verify_response, verified_inventory = etsy_request(
+        "GET", f"/listings/{listing_id}/inventory"
+    )
+    require_etsy_success(verify_response, verified_inventory, "Vérification de la restauration")
+    verified_payload, verified_changes = _clean_inventory_payload(verified_inventory, Decimal("0"))
+    if (
+        len(verified_changes) != len(expected_changes)
+        or _semantic_inventory_fingerprint(verified_payload)
+        != _semantic_inventory_fingerprint(clean_payload)
+    ):
+        raise HTTPException(502, "La restauration Etsy n’a pas pu être vérifiée")
+    return {
+        "success": True,
+        "restored": True,
+        "verified": True,
+        "listing_id": listing_id,
+        "count_prices": len(expected_changes),
+        "inventory_sha256": _inventory_fingerprint(clean_payload),
+    }
 
 
 def receipt_to_rows(receipt, include_thumbnails=True, now=None):
@@ -565,6 +2163,119 @@ def list_carriers():
     response, data = etsy_request("GET", "/shipping-carriers", params={"origin_country_iso": "FR"})
     require_etsy_success(response, data, "Récupération des transporteurs")
     return data
+
+
+@app.post("/listing-prices/{listing_id}/adjust", tags=["pricing"], dependencies=PROTECTED)
+def adjust_listing_prices(
+    listing_id: int,
+    amount: float,
+    apply: bool = False,
+    no_strap_policy: str = "full",
+    expected_inventory_sha256: str = None,
+    pricing_profile: str = "fixed",
+    sale_discount_percent: float = None,
+    delivered_targets_json: str = None,
+    discounted_baselines_json: str = None,
+    expected_pricing_context_sha256: str = None,
+    promotion_source: str = None,
+):
+    """Ajoute un montant fixe à toutes les options, avec aperçu par défaut."""
+    return listing_price_adjustment(
+        listing_id,
+        amount,
+        apply,
+        no_strap_policy,
+        expected_inventory_sha256,
+        pricing_profile,
+        sale_discount_percent,
+        delivered_targets_json,
+        discounted_baselines_json,
+        expected_pricing_context_sha256,
+        promotion_source,
+    )
+
+
+@app.get("/listing-prices/catalog", tags=["pricing"], dependencies=PROTECTED)
+def get_listing_price_catalog():
+    return listing_price_catalog()
+
+
+@app.post("/listing-prices/{listing_id}/restore", tags=["pricing"], dependencies=PROTECTED)
+def restore_listing_prices(listing_id: int, backup_payload: dict = Body(...)):
+    return restore_listing_inventory(listing_id, backup_payload)
+
+
+@app.post(
+    "/listing-variations/{listing_id}/normalize-rotate-detach",
+    tags=["pricing"],
+    dependencies=PROTECTED,
+)
+def normalize_rotate_detach_variations(
+    listing_id: int,
+    apply: bool = False,
+    sale_discount_percent: float = None,
+    delivered_target: float = 29.99,
+    promotion_source: str = None,
+    expected_inventory_sha256: str = None,
+    expected_pricing_context_sha256: str = None,
+):
+    return normalize_rotate_detach_listing(
+        listing_id,
+        apply,
+        sale_discount_percent,
+        delivered_target,
+        promotion_source,
+        expected_inventory_sha256,
+        expected_pricing_context_sha256,
+    )
+
+
+@app.post(
+    "/listing-variations/{listing_id}/ensure-attraction-anchor",
+    tags=["pricing"],
+    dependencies=PROTECTED,
+)
+def ensure_attraction_anchor_variation(
+    listing_id: int,
+    apply: bool = False,
+    sale_discount_percent: float = None,
+    promotion_source: str = None,
+    expected_inventory_sha256: str = None,
+    expected_pricing_context_sha256: str = None,
+):
+    return ensure_attraction_anchor_listing(
+        listing_id,
+        apply,
+        sale_discount_percent,
+        promotion_source,
+        expected_inventory_sha256,
+        expected_pricing_context_sha256,
+    )
+
+
+@app.post(
+    "/listing-variations/{listing_id}/add-device-option",
+    tags=["pricing"],
+    dependencies=PROTECTED,
+)
+def add_device_option(
+    listing_id: int,
+    source_device: str,
+    new_device: str,
+    included_styles_json: str = None,
+    apply: bool = False,
+    expected_inventory_sha256: str = None,
+    expected_operation_sha256: str = None,
+):
+    return add_device_option_listing(
+        listing_id,
+        source_device,
+        new_device,
+        included_styles_json,
+        apply=apply,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_operation_sha256=expected_operation_sha256,
+    )
 
 
 @app.get("/listings-stats", tags=["analytics"], dependencies=PROTECTED)
