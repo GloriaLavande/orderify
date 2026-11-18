@@ -20,7 +20,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.7.1"
+APP_VERSION = "3.7.2"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -1039,7 +1039,7 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
 
     included_styles = _parse_device_styles(included_styles)
     selected_style_keys = {_canonical_device_style(style) for style in included_styles}
-    source_products = []
+    source_products = list(all_source_products)
     found_style_keys = set()
     for product in all_source_products:
         _model, style = _product_model_style(
@@ -1047,7 +1047,6 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
         )
         style_key = _canonical_device_style(style)
         if not selected_style_keys or style_key in selected_style_keys:
-            source_products.append(product)
             found_style_keys.add(style_key)
     missing_styles = selected_style_keys - found_style_keys
     if missing_styles:
@@ -1095,14 +1094,23 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
         device_property = cloned["property_values"][device_index]
         device_property["values"] = [str(new_device).strip()]
         device_property["value_ids"] = []
+        _model, style = _product_model_style(
+            cloned.get("property_values"), cloned.get("sku")
+        )
+        style_enabled = (
+            not selected_style_keys
+            or _canonical_device_style(style) in selected_style_keys
+        )
+        for offering in cloned.get("offerings") or []:
+            offering["is_enabled"] = bool(style_enabled and offering.get("is_enabled", True))
         additions.append(cloned)
-        _model, style = _product_model_style(cloned.get("property_values"), cloned.get("sku"))
         changes.append({
             "source_device": str(source_device).strip(),
             "new_device": str(new_device).strip(),
             "style": style,
             "sku": cloned.get("sku") or "",
             "count_offerings": len(cloned.get("offerings") or []),
+            "is_enabled": style_enabled,
         })
 
     before = len(clean["products"])
@@ -1111,6 +1119,8 @@ def _add_device_option_payload(inventory, source_device, new_device, included_st
         "affected": True,
         "already_exists": False,
         "count_added": len(additions),
+        "count_enabled_added": sum(change["is_enabled"] for change in changes),
+        "count_disabled_placeholders": sum(not change["is_enabled"] for change in changes),
         "count_products_before": before,
         "count_products_after": len(clean["products"]),
         "included_styles": included_styles,

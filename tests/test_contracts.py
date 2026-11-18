@@ -198,10 +198,16 @@ class BackendContractTests(unittest.TestCase):
             for product in basic_payload["products"]
             if backend._device_value(product) == "Z8PC57"
         }
-        self.assertEqual(basic_counts["count_added"], 4)
-        self.assertEqual(basic_styles, {
-            "Rotate&Detach", "No strap", "ClearBack Hand Strap", "Clear Back No Strap",
-        })
+        self.assertEqual(basic_counts["count_added"], 5)
+        self.assertEqual(basic_counts["count_enabled_added"], 4)
+        self.assertEqual(basic_counts["count_disabled_placeholders"], 1)
+        self.assertEqual(basic_styles, set(styles))
+        basic_changes = {change["style"]: change["is_enabled"] for change in _changes}
+        self.assertFalse(basic_changes["Built-in Hand Strap"])
+        self.assertTrue(all(
+            basic_changes[style]
+            for style in styles if style != "Built-in Hand Strap"
+        ))
 
         paperwhite_payload, _changes, paperwhite_counts = backend._add_device_option_payload(
             inventory,
@@ -214,10 +220,13 @@ class BackendContractTests(unittest.TestCase):
             for product in paperwhite_payload["products"]
             if backend._device_value(product) == "KPW7/Z4P32D"
         }
-        self.assertEqual(paperwhite_counts["count_added"], 3)
-        self.assertEqual(paperwhite_styles, {
-            "Rotate&Detach", "No strap", "Clear Back No Strap",
-        })
+        self.assertEqual(paperwhite_counts["count_added"], 5)
+        self.assertEqual(paperwhite_counts["count_enabled_added"], 3)
+        self.assertEqual(paperwhite_counts["count_disabled_placeholders"], 2)
+        self.assertEqual(paperwhite_styles, set(styles))
+        paperwhite_changes = {change["style"]: change["is_enabled"] for change in _changes}
+        self.assertFalse(paperwhite_changes["Built-in Hand Strap"])
+        self.assertFalse(paperwhite_changes["ClearBack Hand Strap"])
 
         with self.assertRaises(backend.HTTPException) as raised:
             backend._add_device_option_payload(
