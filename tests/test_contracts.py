@@ -3,7 +3,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("ETSY_API_KEY", "etsy-client")
 os.environ.setdefault("ETSY_SECRET", "etsy-secret")
@@ -125,6 +125,74 @@ class BackendContractTests(unittest.TestCase):
             ).status_code,
             401,
         )
+        self.assertEqual(self.client.post("/listing-publish/42/preview", json={}).status_code, 401)
+        self.assertEqual(self.client.post("/listing-publish/42/apply").status_code, 401)
+
+    def test_publish_preview_is_read_only_and_returns_fresh_fingerprint(self):
+        backend.STATE["shop_id"] = 7
+        response = Mock(status_code=200)
+        listing = {
+            "listing_id": 42, "shop_id": 7, "state": "draft",
+            "title": "Name", "description": "Description", "featured_rank": 1,
+            "images": [{"listing_image_id": 10, "rank": 1}],
+        }
+        inventory = delivered_inventory("No strap")
+        payload = {
+            "title": "Blue Library Kindle Case",
+            "description": "Ready for Etsy",
+            "quantity": 73,
+            "sku_prefix": "BLU",
+            "image_sha256s": ["a" * 64, "b" * 64],
+        }
+        with patch.object(backend, "etsy_request", side_effect=[(response, listing), (response, inventory)]) as request:
+            result = self.client.post(
+                "/listing-publish/42/preview", headers=API_HEADERS, json=payload
+            )
+        self.assertEqual(result.status_code, 200)
+        body = result.json()
+        self.assertFalse(body["applied"])
+        self.assertEqual(body["existing_image_count"], 1)
+        self.assertEqual(body["new_image_count"], 2)
+        self.assertEqual(len(body["plan_sha256"]), 64)
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET"])
+
+    def test_publish_apply_rejects_stale_preview_before_any_write(self):
+        backend.STATE["shop_id"] = 7
+        response = Mock(status_code=200)
+        listing = {
+            "listing_id": 42, "shop_id": 7, "state": "draft",
+            "title": "Name", "description": "Description", "featured_rank": 1,
+            "images": [{"listing_image_id": 10, "rank": 1}],
+        }
+        inventory = delivered_inventory("No strap")
+        blob = b"final-png"
+        digest = backend.hashlib.sha256(blob).hexdigest()
+        data = {
+            "title": "Blue Library Kindle Case",
+            "description": "Ready for Etsy",
+            "quantity": "73",
+            "sku_prefix": "BLU",
+            "image_sha256s": json.dumps([digest]),
+            "expected_plan_sha256": "0" * 64,
+            "confirmation": "PUBLISH",
+        }
+        with patch.object(backend, "etsy_request", side_effect=[(response, listing), (response, inventory)]) as request:
+            result = self.client.post(
+                "/listing-publish/42/apply", headers=API_HEADERS, data=data,
+                files=[("images", ("mockup.png", blob, "image/png"))],
+            )
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET"])
+
+    def test_publish_inventory_changes_only_quantity_and_sku(self):
+        inventory = delivered_inventory("No strap", cents=4023)
+        payload = backend._publish_inventory_payload(inventory, 73, "BLU")
+        product = payload["products"][0]
+        self.assertRegex(product["sku"], r"^[A-Z]{5}$")
+        self.assertEqual(product["property_values"], inventory["products"][0]["property_values"])
+        self.assertEqual(product["offerings"][0]["quantity"], 73)
+        self.assertEqual(product["offerings"][0]["price"], 40.23)
+        self.assertEqual(payload["price_on_property"], inventory["price_on_property"])
 
     def test_add_device_payload_clones_every_source_combination(self):
         first = delivered_inventory("No strap", model="OLD")

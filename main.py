@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -13,14 +14,14 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 import requests
-from fastapi import Body, Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.7.2"
+APP_VERSION = "3.8.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -47,6 +48,7 @@ app = FastAPI(
         {"name": "orders", "description": "Commandes et articles Etsy."},
         {"name": "shipping", "description": "Suivi et transporteurs."},
         {"name": "analytics", "description": "Données et statistiques des listings."},
+        {"name": "listings", "description": "Aperçu et publication contrôlée des drafts."},
         {"name": "pricing", "description": "Aperçu et modification sécurisée des prix."},
         {"name": "admin", "description": "Actions administratives protégées."},
     ],
@@ -185,7 +187,7 @@ def get_headers():
     }
 
 
-def etsy_request(method, path, *, params=None, data=None, json_data=None, authenticated=True):
+def etsy_request(method, path, *, params=None, data=None, json_data=None, files=None, authenticated=True):
     url = path if path.startswith("http") else f"{API_BASE}{path}"
     headers = get_headers() if authenticated else None
     try:
@@ -193,6 +195,7 @@ def etsy_request(method, path, *, params=None, data=None, json_data=None, authen
             "headers": headers,
             "params": params,
             "data": data,
+            "files": files,
             "timeout": REQUEST_TIMEOUT,
         }
         if json_data is not None:
@@ -1945,6 +1948,273 @@ def restore_listing_inventory(listing_id, backup_payload):
     }
 
 
+def _publish_sku(prefix, index):
+    return f"{prefix[:3]}{chr(65 + (index // 26) % 26)}{chr(65 + index % 26)}"
+
+
+def _publish_inventory_payload(inventory, quantity, sku_prefix):
+    """Conserve options/prix/états et ne change que quantité et SKU."""
+    sku_properties = {int(value) for value in inventory.get("sku_on_property") or []}
+    sku_by_key = {}
+    products = []
+    for source_product in inventory.get("products") or []:
+        key_parts = []
+        if sku_properties:
+            for prop in source_product.get("property_values") or []:
+                if int(prop.get("property_id") or 0) in sku_properties:
+                    key_parts.append((
+                        int(prop.get("property_id") or 0),
+                        tuple(int(value) for value in prop.get("value_ids") or []),
+                        tuple(str(value) for value in prop.get("values") or []),
+                    ))
+        key = tuple(key_parts) if key_parts else ("listing",)
+        if key not in sku_by_key:
+            sku_by_key[key] = _publish_sku(sku_prefix, len(sku_by_key))
+        product = {
+            "sku": sku_by_key[key],
+            "property_values": [
+                {
+                    field: prop[field]
+                    for field in ("property_id", "property_name", "scale_id", "value_ids", "values")
+                    if prop.get(field) is not None
+                }
+                for prop in source_product.get("property_values") or []
+            ],
+            "offerings": [],
+        }
+        for source_offering in source_product.get("offerings") or []:
+            price = source_offering.get("price") or {}
+            divisor = price.get("divisor") or 100
+            product["offerings"].append({
+                "price": (price.get("amount") or 0) / divisor,
+                "quantity": quantity,
+                "is_enabled": bool(source_offering.get("is_enabled")),
+                "readiness_state_id": source_offering.get("readiness_state_id"),
+            })
+        products.append(product)
+    payload = {"products": products}
+    for field in (
+        "price_on_property", "quantity_on_property", "sku_on_property",
+        "readiness_state_on_property",
+    ):
+        payload[field] = inventory.get(field) or []
+    return payload
+
+
+def _validate_publish_inputs(title, description, quantity, sku_prefix, image_sha256s):
+    title = str(title or "").strip()
+    description = str(description or "").strip()
+    sku_prefix = str(sku_prefix or "").strip().upper()
+    if not title or len(title) > 140:
+        raise HTTPException(422, "Le titre doit contenir entre 1 et 140 caractères")
+    if not description:
+        raise HTTPException(422, "La description est obligatoire")
+    if not 50 <= int(quantity) <= 100:
+        raise HTTPException(422, "La quantité doit être comprise entre 50 et 100")
+    if not re.fullmatch(r"[A-Z]{3}", sku_prefix):
+        raise HTTPException(422, "Le préfixe SKU doit contenir exactement 3 lettres majuscules")
+    if not isinstance(image_sha256s, list) or not 1 <= len(image_sha256s) <= 13:
+        raise HTTPException(422, "Entre 1 et 13 images finales sont requises")
+    if any(not re.fullmatch(r"[0-9a-f]{64}", str(value or "")) for value in image_sha256s):
+        raise HTTPException(422, "Empreinte d'image invalide")
+    return title, description, int(quantity), sku_prefix
+
+
+def _publish_context(listing_id, title, description, quantity, sku_prefix, image_sha256s):
+    title, description, quantity, sku_prefix = _validate_publish_inputs(
+        title, description, quantity, sku_prefix, image_sha256s
+    )
+    shop_id = get_shop_id_for_user()
+    listing_response, listing = etsy_request(
+        "GET", f"/listings/{listing_id}", params={"includes": "Images"}
+    )
+    require_etsy_success(listing_response, listing, "Récupération du draft")
+    if int(listing.get("shop_id") or 0) != int(shop_id):
+        raise HTTPException(403, "Ce draft n'appartient pas à la boutique autorisée")
+    if listing.get("state") != "draft":
+        raise HTTPException(409, "Le listing ciblé n'est plus un draft")
+    if int(listing.get("featured_rank") or 0) <= 0:
+        raise HTTPException(409, "Active d'abord « Feature this listing » dans le draft")
+    existing_images = listing.get("images") or []
+    if len(existing_images) + len(image_sha256s) > 20:
+        raise HTTPException(422, "Le total dépasserait la limite de 20 images Etsy")
+    inventory_response, inventory = etsy_request("GET", f"/listings/{listing_id}/inventory")
+    require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
+    if not inventory.get("products"):
+        raise HTTPException(422, "L'inventaire du draft est vide")
+    backup_inventory, _ = _clean_inventory_payload(inventory, Decimal("0"))
+    desired_inventory = _publish_inventory_payload(inventory, quantity, sku_prefix)
+    context = {
+        "listing_id": int(listing_id),
+        "shop_id": int(shop_id),
+        "draft": {
+            "state": listing.get("state"),
+            "title": listing.get("title"),
+            "description": listing.get("description"),
+            "featured_rank": listing.get("featured_rank"),
+            "images": [
+                {"listing_image_id": image.get("listing_image_id"), "rank": image.get("rank")}
+                for image in existing_images
+            ],
+        },
+        "inventory": backup_inventory,
+        "requested": {
+            "title": title,
+            "description": description,
+            "quantity": quantity,
+            "sku_prefix": sku_prefix,
+            "image_sha256s": image_sha256s,
+        },
+    }
+    return {
+        "shop_id": int(shop_id),
+        "listing": listing,
+        "inventory": inventory,
+        "backup_inventory": backup_inventory,
+        "desired_inventory": desired_inventory,
+        "existing_images": existing_images,
+        "plan_sha256": _inventory_fingerprint(context),
+        "title": title,
+        "description": description,
+        "quantity": quantity,
+        "sku_prefix": sku_prefix,
+    }
+
+
+def preview_listing_publish(listing_id, payload):
+    context = _publish_context(
+        listing_id,
+        payload.get("title"), payload.get("description"), payload.get("quantity"),
+        payload.get("sku_prefix"), payload.get("image_sha256s"),
+    )
+    return {
+        "success": True,
+        "applied": False,
+        "listing_id": int(listing_id),
+        "shop_id": context["shop_id"],
+        "plan_sha256": context["plan_sha256"],
+        "existing_image_count": len(context["existing_images"]),
+        "new_image_count": len(payload.get("image_sha256s") or []),
+        "variant_count": len(context["inventory"].get("products") or []),
+        "featured": True,
+        "state": "draft",
+        "preserved": [
+            "category", "variations", "prices", "custom_options", "tags",
+            "attributes", "shipping", "processing", "existing_images",
+        ],
+    }
+
+
+def apply_listing_publish(
+    listing_id, title, description, quantity, sku_prefix, image_sha256s,
+    expected_plan_sha256, confirmation, images,
+):
+    if confirmation != "PUBLISH":
+        raise HTTPException(422, "Confirmation PUBLISH obligatoire")
+    try:
+        hashes = json.loads(image_sha256s)
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(422, "Liste d'empreintes d'images invalide") from None
+    if len(images) != len(hashes):
+        raise HTTPException(422, "Le nombre de fichiers ne correspond pas au plan")
+    image_blobs = []
+    for upload, expected_hash in zip(images, hashes):
+        blob = upload.file.read()
+        if not blob or len(blob) > 20 * 1024 * 1024:
+            raise HTTPException(422, "Une image est vide ou dépasse 20 Mo")
+        actual_hash = hashlib.sha256(blob).hexdigest()
+        if not secrets.compare_digest(actual_hash, expected_hash):
+            raise HTTPException(409, "Une image a changé depuis l'aperçu")
+        image_blobs.append((upload.filename or "mockup.png", upload.content_type or "image/png", blob))
+
+    context = _publish_context(
+        listing_id, title, description, quantity, sku_prefix, hashes
+    )
+    if not expected_plan_sha256 or not secrets.compare_digest(
+        expected_plan_sha256, context["plan_sha256"]
+    ):
+        raise HTTPException(409, "Le draft ou l'inventaire a changé depuis l'aperçu")
+
+    shop_id = context["shop_id"]
+    old_title = context["listing"].get("title") or ""
+    old_description = context["listing"].get("description") or ""
+    uploaded_ids = []
+    mutated = False
+    try:
+        response, data = etsy_request(
+            "PATCH", f"/shops/{shop_id}/listings/{listing_id}",
+            data={"title": context["title"], "description": context["description"]},
+        )
+        require_etsy_success(response, data, "Mise à jour du SEO")
+        mutated = True
+        response, data = etsy_request(
+            "PUT", f"/listings/{listing_id}/inventory",
+            params={"max_variations_supported": "3"},
+            json_data=context["desired_inventory"],
+        )
+        require_etsy_success(response, data, "Mise à jour des quantités et SKU")
+        for filename, content_type, blob in reversed(image_blobs):
+            response, data = etsy_request(
+                "POST", f"/shops/{shop_id}/listings/{listing_id}/images",
+                data={"rank": "1", "overwrite": "false"},
+                files={"image": (filename, blob, content_type)},
+            )
+            require_etsy_success(response, data, "Ajout d'une image")
+            image_id = int(data.get("listing_image_id") or 0)
+            if not image_id:
+                raise HTTPException(502, "Etsy n'a pas confirmé une image")
+            uploaded_ids.insert(0, image_id)
+
+        verify_response, verified = etsy_request(
+            "GET", f"/listings/{listing_id}", params={"includes": "Images"}
+        )
+        require_etsy_success(verify_response, verified, "Vérification du draft")
+        ordered_images = sorted(verified.get("images") or [], key=lambda item: item.get("rank") or 0)
+        actual_front_ids = [int(item.get("listing_image_id") or 0) for item in ordered_images[:len(uploaded_ids)]]
+        if (
+            verified.get("state") != "draft"
+            or verified.get("title") != context["title"]
+            or verified.get("description") != context["description"]
+            or actual_front_ids != uploaded_ids
+        ):
+            raise HTTPException(502, "Le contrôle final du draft a échoué")
+
+        response, data = etsy_request(
+            "PATCH", f"/shops/{shop_id}/listings/{listing_id}", data={"state": "active"}
+        )
+        require_etsy_success(response, data, "Publication du listing")
+        return {
+            "success": True,
+            "applied": True,
+            "verified": True,
+            "listing_id": int(listing_id),
+            "listing_url": data.get("url") or f"https://www.etsy.com/listing/{listing_id}",
+            "uploaded_image_ids": uploaded_ids,
+        }
+    except Exception:
+        if mutated:
+            for image_id in uploaded_ids:
+                try:
+                    etsy_request(
+                        "DELETE", f"/shops/{shop_id}/listings/{listing_id}/images/{image_id}"
+                    )
+                except Exception:
+                    pass
+            try:
+                etsy_request(
+                    "PUT", f"/listings/{listing_id}/inventory",
+                    params={"max_variations_supported": "3"},
+                    json_data=context["backup_inventory"],
+                )
+                etsy_request(
+                    "PATCH", f"/shops/{shop_id}/listings/{listing_id}",
+                    data={"title": old_title, "description": old_description},
+                )
+            except Exception:
+                pass
+        raise
+
+
 def receipt_to_rows(receipt, include_thumbnails=True, now=None):
     """Return the stable superset consumed by every Orderify client."""
     now = now or time.time()
@@ -2233,6 +2503,31 @@ def get_listing_price_catalog():
 @app.post("/listing-prices/{listing_id}/restore", tags=["pricing"], dependencies=PROTECTED)
 def restore_listing_prices(listing_id: int, backup_payload: dict = Body(...)):
     return restore_listing_inventory(listing_id, backup_payload)
+
+
+@app.post("/listing-publish/{listing_id}/preview", tags=["listings"], dependencies=PROTECTED)
+def listing_publish_preview(listing_id: int, payload: dict = Body(...)):
+    """Aperçu immuable : aucune écriture Etsy."""
+    return preview_listing_publish(listing_id, payload)
+
+
+@app.post("/listing-publish/{listing_id}/apply", tags=["listings"], dependencies=PROTECTED)
+def listing_publish_apply(
+    listing_id: int,
+    title: str = Form(...),
+    description: str = Form(...),
+    quantity: int = Form(...),
+    sku_prefix: str = Form(...),
+    image_sha256s: str = Form(...),
+    expected_plan_sha256: str = Form(...),
+    confirmation: str = Form(...),
+    images: list[UploadFile] = File(...),
+):
+    """Publie seulement après empreinte d'aperçu et confirmation explicite."""
+    return apply_listing_publish(
+        listing_id, title, description, quantity, sku_prefix, image_sha256s,
+        expected_plan_sha256, confirmation, images,
+    )
 
 
 @app.post(
