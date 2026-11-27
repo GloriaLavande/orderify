@@ -2033,8 +2033,6 @@ def _publish_context(listing_id, title, description, quantity, sku_prefix, image
         raise HTTPException(403, "Ce draft n'appartient pas à la boutique autorisée")
     if listing.get("state") != "draft":
         raise HTTPException(409, "Le listing ciblé n'est plus un draft")
-    if int(listing.get("featured_rank") or 0) <= 0:
-        raise HTTPException(409, "Active d'abord « Feature this listing » dans le draft")
     existing_images = listing.get("images") or []
     if len(existing_images) + len(image_sha256s) > 20:
         raise HTTPException(422, "Le total dépasserait la limite de 20 images Etsy")
@@ -2096,7 +2094,10 @@ def preview_listing_publish(listing_id, payload):
         "existing_image_count": len(context["existing_images"]),
         "new_image_count": len(payload.get("image_sha256s") or []),
         "variant_count": len(context["inventory"].get("products") or []),
-        "featured": True,
+        # Etsy renvoie souvent featured_rank=0 sur un draft même lorsque le
+        # commutateur est actif dans l'éditeur. Le backend préserve ce réglage
+        # en ne l'envoyant jamais dans le PATCH, mais ne prétend pas le deviner.
+        "featured": int(context["listing"].get("featured_rank") or 0) > 0,
         "state": "draft",
         "preserved": [
             "category", "variations", "prices", "custom_options", "tags",

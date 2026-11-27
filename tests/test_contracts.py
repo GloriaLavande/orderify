@@ -156,6 +156,27 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(len(body["plan_sha256"]), 64)
         self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET"])
 
+    def test_publish_preview_does_not_reject_unreliable_draft_feature_rank(self):
+        backend.STATE["shop_id"] = 7
+        response = Mock(status_code=200)
+        listing = {
+            "listing_id": 42, "shop_id": 7, "state": "draft",
+            "title": "Name", "description": "Description", "featured_rank": 0,
+            "images": [{"listing_image_id": 10, "rank": 1}],
+        }
+        payload = {
+            "title": "Blue Library Kindle Case", "description": "Ready for Etsy",
+            "quantity": 73, "sku_prefix": "BLU", "image_sha256s": ["a" * 64],
+        }
+        with patch.object(backend, "etsy_request", side_effect=[
+            (response, listing), (response, delivered_inventory("No strap")),
+        ]):
+            result = self.client.post(
+                "/listing-publish/42/preview", headers=API_HEADERS, json=payload
+            )
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.json()["featured"])
+
     def test_publish_apply_rejects_stale_preview_before_any_write(self):
         backend.STATE["shop_id"] = 7
         response = Mock(status_code=200)
