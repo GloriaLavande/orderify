@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -2001,6 +2002,35 @@ def _publish_inventory_payload(inventory, quantity, sku_prefix):
     return payload
 
 
+def _normalized_publish_text(value):
+    """Normalise uniquement les transformations de transport sans masquer un changement de contenu."""
+    text = unicodedata.normalize("NFC", html.unescape(str(value or "")))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
+
+
+def _publish_draft_mismatches(verified, expected_title, expected_description, uploaded_ids):
+    ordered_images = sorted(
+        verified.get("images") or [], key=lambda item: int(item.get("rank") or 0)
+    )
+    actual_front_ids = [
+        int(item.get("listing_image_id") or 0)
+        for item in ordered_images[:len(uploaded_ids)]
+    ]
+    mismatches = []
+    if verified.get("state") != "draft":
+        mismatches.append(f"état={verified.get('state') or 'absent'}")
+    if _normalized_publish_text(verified.get("title")) != _normalized_publish_text(expected_title):
+        mismatches.append("titre")
+    if _normalized_publish_text(verified.get("description")) != _normalized_publish_text(expected_description):
+        mismatches.append("description")
+    if actual_front_ids != uploaded_ids:
+        mismatches.append(
+            f"ordre_images attendu={uploaded_ids} reçu={actual_front_ids}"
+        )
+    return mismatches
+
+
 def _validate_publish_inputs(title, description, quantity, sku_prefix, image_sha256s):
     title = str(title or "").strip()
     description = str(description or "").strip()
@@ -2166,19 +2196,25 @@ def apply_listing_publish(
                 raise HTTPException(502, "Etsy n'a pas confirmé une image")
             uploaded_ids.insert(0, image_id)
 
-        verify_response, verified = etsy_request(
-            "GET", f"/listings/{listing_id}", params={"includes": "Images"}
-        )
-        require_etsy_success(verify_response, verified, "Vérification du draft")
-        ordered_images = sorted(verified.get("images") or [], key=lambda item: item.get("rank") or 0)
-        actual_front_ids = [int(item.get("listing_image_id") or 0) for item in ordered_images[:len(uploaded_ids)]]
-        if (
-            verified.get("state") != "draft"
-            or verified.get("title") != context["title"]
-            or verified.get("description") != context["description"]
-            or actual_front_ids != uploaded_ids
-        ):
-            raise HTTPException(502, "Le contrôle final du draft a échoué")
+        mismatches = []
+        for attempt in range(4):
+            if attempt:
+                time.sleep(attempt)
+            verify_response, verified = etsy_request(
+                "GET", f"/listings/{listing_id}", params={"includes": "Images"}
+            )
+            require_etsy_success(verify_response, verified, "Vérification du draft")
+            mismatches = _publish_draft_mismatches(
+                verified, context["title"], context["description"], uploaded_ids
+            )
+            if not mismatches:
+                break
+        if mismatches:
+            raise HTTPException(
+                502,
+                "Le contrôle final du draft a échoué après 4 vérifications : "
+                + "; ".join(mismatches),
+            )
 
         response, data = etsy_request(
             "PATCH", f"/shops/{shop_id}/listings/{listing_id}", data={"state": "active"}

@@ -215,6 +215,36 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(product["offerings"][0]["price"], 40.23)
         self.assertEqual(payload["price_on_property"], inventory["price_on_property"])
 
+    def test_publish_verification_accepts_safe_etsy_text_normalization(self):
+        verified = {
+            "state": "draft",
+            "title": "Luna &amp; Books",
+            "description": "First line  \r\nSecond line\r\n",
+            "images": [
+                {"listing_image_id": 101, "rank": 1},
+                {"listing_image_id": 102, "rank": 2},
+            ],
+        }
+        self.assertEqual(
+            backend._publish_draft_mismatches(
+                verified, "Luna & Books", "First line\nSecond line", [101, 102]
+            ),
+            [],
+        )
+
+    def test_publish_verification_keeps_image_order_strict(self):
+        verified = {
+            "state": "draft", "title": "Title", "description": "Description",
+            "images": [
+                {"listing_image_id": 102, "rank": 1},
+                {"listing_image_id": 101, "rank": 2},
+            ],
+        }
+        mismatches = backend._publish_draft_mismatches(
+            verified, "Title", "Description", [101, 102]
+        )
+        self.assertTrue(any("ordre_images" in item for item in mismatches))
+
     def test_add_device_payload_clones_every_source_combination(self):
         first = delivered_inventory("No strap", model="OLD")
         second = delivered_inventory("Clear Back No Strap", model="OLD")["products"][0]
