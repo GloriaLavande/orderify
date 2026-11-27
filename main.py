@@ -23,7 +23,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.9.1"
+APP_VERSION = "3.9.2"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -2161,25 +2161,16 @@ def _upload_listing_image(shop_id, listing_id, filename, content_type, blob):
 
 
 def _force_listing_image_order(shop_id, listing_id, desired_ids):
-    # Etsy documente la réassociation d'une image supprimée. On détache donc
-    # les images de la copie uniquement, puis on les réassocie en ordre inverse
-    # au rang 1 afin d'obtenir exactement l'ordre demandé.
-    for image_id in desired_ids:
-        response, data = etsy_request(
-            "DELETE", f"/shops/{shop_id}/listings/{listing_id}/images/{image_id}"
-        )
-        require_etsy_success(response, data, "Préparation de l'ordre des images")
-    ordered_ids = []
-    for image_id in reversed(desired_ids):
-        response, data = etsy_request(
-            "POST", f"/shops/{shop_id}/listings/{listing_id}/images",
-            data={"listing_image_id": image_id, "rank": "1", "overwrite": "false"},
-        )
-        require_etsy_success(response, data, "Réorganisation des images")
-        confirmed = int(data.get("listing_image_id") or 0)
-        if confirmed != image_id:
-            raise HTTPException(502, "Etsy n'a pas confirmé la réorganisation d'une image")
-        ordered_ids.insert(0, confirmed)
+    # updateListing accepte image_ids dans l'ordre d'affichage voulu. Cette
+    # opération atomique évite de détacher la dernière image, ce qu'Etsy refuse.
+    ordered_ids = [int(image_id) for image_id in desired_ids]
+    if not ordered_ids:
+        raise HTTPException(422, "Au moins une image est requise pour ordonner le listing")
+    response, data = etsy_request(
+        "PATCH", f"/shops/{shop_id}/listings/{listing_id}",
+        data={"image_ids": ",".join(str(image_id) for image_id in ordered_ids)},
+    )
+    require_etsy_success(response, data, "Réorganisation des images")
     return ordered_ids
 
 

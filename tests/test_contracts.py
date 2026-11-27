@@ -307,6 +307,16 @@ class BackendContractTests(unittest.TestCase):
         paths = [call.args[1] for call in request.call_args_list]
         self.assertEqual(paths[-1], "/shops/7/listings/42/properties")
 
+    def test_publish_image_order_is_applied_atomically_without_deleting_images(self):
+        ok = Mock(status_code=200)
+        with patch.object(backend, "etsy_request", return_value=(ok, {})) as request:
+            ordered = backend._force_listing_image_order(7, 42, [301, 302, 101, 102])
+        self.assertEqual(ordered, [301, 302, 101, 102])
+        request.assert_called_once_with(
+            "PATCH", "/shops/7/listings/42",
+            data={"image_ids": "301,302,101,102"},
+        )
+
     def test_publish_applies_changes_to_clone_and_preserves_template(self):
         inventory = delivered_inventory("No strap", cents=4023)
         inventory["products"][0]["offerings"][0]["readiness_state_id"] = 9
