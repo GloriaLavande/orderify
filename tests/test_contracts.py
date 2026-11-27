@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import sys
 import unittest
@@ -144,7 +145,10 @@ class BackendContractTests(unittest.TestCase):
             "sku_prefix": "BLU",
             "image_sha256s": ["a" * 64, "b" * 64],
         }
-        with patch.object(backend, "etsy_request", side_effect=[(response, listing), (response, inventory)]) as request:
+        with patch.object(backend, "etsy_request", side_effect=[
+            (response, listing), (response, inventory),
+            (response, {"personalization_questions": []}), (response, {"results": []}),
+        ]) as request:
             result = self.client.post(
                 "/listing-publish/42/preview", headers=API_HEADERS, json=payload
             )
@@ -154,7 +158,7 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(body["existing_image_count"], 1)
         self.assertEqual(body["new_image_count"], 2)
         self.assertEqual(len(body["plan_sha256"]), 64)
-        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET"])
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET"] * 4)
 
     def test_publish_preview_does_not_reject_unreliable_draft_feature_rank(self):
         backend.STATE["shop_id"] = 7
@@ -170,6 +174,7 @@ class BackendContractTests(unittest.TestCase):
         }
         with patch.object(backend, "etsy_request", side_effect=[
             (response, listing), (response, delivered_inventory("No strap")),
+            (response, {"personalization_questions": []}), (response, {"results": []}),
         ]):
             result = self.client.post(
                 "/listing-publish/42/preview", headers=API_HEADERS, json=payload
@@ -197,13 +202,16 @@ class BackendContractTests(unittest.TestCase):
             "expected_plan_sha256": "0" * 64,
             "confirmation": "PUBLISH",
         }
-        with patch.object(backend, "etsy_request", side_effect=[(response, listing), (response, inventory)]) as request:
+        with patch.object(backend, "etsy_request", side_effect=[
+            (response, listing), (response, inventory),
+            (response, {"personalization_questions": []}), (response, {"results": []}),
+        ]) as request:
             result = self.client.post(
                 "/listing-publish/42/apply", headers=API_HEADERS, data=data,
                 files=[("images", ("mockup.png", blob, "image/png"))],
             )
         self.assertEqual(result.status_code, 409)
-        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET", "GET"])
+        self.assertEqual([call.args[0] for call in request.call_args_list], ["GET"] * 4)
 
     def test_publish_inventory_changes_only_quantity_and_sku(self):
         inventory = delivered_inventory("No strap", cents=4023)
@@ -244,6 +252,85 @@ class BackendContractTests(unittest.TestCase):
             verified, "Title", "Description", [101, 102]
         )
         self.assertTrue(any("ordre_images" in item for item in mismatches))
+
+    def test_publish_builds_an_independent_draft_clone(self):
+        listing = {
+            "title": "Template", "description": "Template description",
+            "quantity": 1, "taxonomy_id": 123, "who_made": "i_did",
+            "when_made": "made_to_order", "is_supply": False,
+            "is_customizable": True, "should_auto_renew": True,
+            "is_taxable": True, "listing_type": "physical",
+            "shipping_profile_id": 55, "return_policy_id": 66,
+            "shop_section_id": 77, "tags": ["kindle case", "reader gift"],
+            "materials": ["plastic"],
+        }
+        inventory = delivered_inventory("No strap", cents=4023)
+        inventory["products"][0]["offerings"][0]["readiness_state_id"] = 9
+        payload = backend._draft_clone_payload(
+            listing, inventory, "New title", "New description"
+        )
+        self.assertEqual(payload["title"], "New title")
+        self.assertEqual(payload["price"], 40.23)
+        self.assertEqual(payload["taxonomy_id"], 123)
+        self.assertEqual(payload["shipping_profile_id"], 55)
+        self.assertEqual(payload["readiness_state_id"], 9)
+        self.assertEqual(payload["tags"], "kindle case,reader gift")
+
+    def test_publish_personalization_copy_drops_source_ids(self):
+        payload = backend._personalization_copy_payload({
+            "personalization_questions": [{
+                "question_id": 99, "question_type": "dropdown",
+                "question_text": "Choose a font", "required": False,
+                "options": [{"option_id": 1, "label": "Font A"}],
+            }]
+        })
+        question = payload["personalization_questions"][0]
+        self.assertNotIn("question_id", question)
+        self.assertEqual(question["options"], [{"label": "Font A"}])
+
+    def test_publish_applies_changes_to_clone_and_preserves_template(self):
+        inventory = delivered_inventory("No strap", cents=4023)
+        inventory["products"][0]["offerings"][0]["readiness_state_id"] = 9
+        title, description = "New title", "New description"
+        blob = b"new-image"
+        digest = backend.hashlib.sha256(blob).hexdigest()
+        context = {
+            "shop_id": 7,
+            "listing": {
+                "listing_id": 42, "taxonomy_id": 123, "who_made": "i_did",
+                "when_made": "made_to_order", "listing_type": "physical",
+            },
+            "inventory": inventory,
+            "desired_inventory": backend._publish_inventory_payload(inventory, 73, "BLU"),
+            "existing_images": [], "properties": {"results": []},
+            "personalization": {"personalization_questions": []},
+            "plan_sha256": "a" * 64, "title": title, "description": description,
+        }
+        uploaded = Mock(filename="new.png", content_type="image/png", file=io.BytesIO(blob))
+        ok = Mock(status_code=200)
+        created = {"listing_id": 900}
+        verified = {
+            "state": "draft", "title": title, "description": description,
+            "images": [{"listing_image_id": 201, "rank": 1}],
+        }
+        activated = {"listing_id": 900, "url": "https://www.etsy.com/listing/900/new"}
+        with patch.object(backend, "_publish_context", return_value=context), \
+             patch.object(backend, "_upload_listing_image", return_value=201), \
+             patch.object(backend, "_force_listing_image_order", return_value=[201]), \
+             patch.object(backend, "_copy_listing_properties"), \
+             patch.object(backend, "etsy_request", side_effect=[
+                 (ok, created), (ok, {}), (ok, verified), (ok, activated),
+             ]) as request:
+            result = backend.apply_listing_publish(
+                42, title, description, 73, "BLU", json.dumps([digest]),
+                "a" * 64, "PUBLISH", [uploaded],
+            )
+        self.assertEqual(result["listing_id"], 900)
+        self.assertEqual(result["template_listing_id"], 42)
+        self.assertTrue(result["template_preserved"])
+        paths = [call.args[1] for call in request.call_args_list]
+        self.assertEqual(paths[0], "/shops/7/listings")
+        self.assertNotIn("/shops/7/listings/42", paths)
 
     def test_add_device_payload_clones_every_source_combination(self):
         first = delivered_inventory("No strap", model="OLD")

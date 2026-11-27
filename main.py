@@ -13,6 +13,7 @@ import unicodedata
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -22,7 +23,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.8.1"
+APP_VERSION = "3.9.0"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -31,7 +32,7 @@ REDIRECT_URI = os.getenv("REDIRECT_URI")
 API_KEY = os.getenv("ORDERIFY_API_KEY")
 ENV_REFRESH_TOKEN = os.getenv("ETSY_REFRESH_TOKEN")
 
-SCOPES = "transactions_r transactions_w shops_r listings_r listings_w"
+SCOPES = "transactions_r transactions_w shops_r listings_r listings_w listings_d"
 AUTH_URL = "https://www.etsy.com/oauth/connect"
 TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 API_BASE = "https://openapi.etsy.com/v3/application"
@@ -2031,6 +2032,157 @@ def _publish_draft_mismatches(verified, expected_title, expected_description, up
     return mismatches
 
 
+def _first_inventory_offering(inventory):
+    for product in inventory.get("products") or []:
+        for offering in product.get("offerings") or []:
+            if offering.get("is_enabled"):
+                return offering
+    for product in inventory.get("products") or []:
+        offerings = product.get("offerings") or []
+        if offerings:
+            return offerings[0]
+    return {}
+
+
+def _draft_clone_payload(listing, inventory, title, description):
+    offering = _first_inventory_offering(inventory)
+    money = offering.get("price") or listing.get("price") or {}
+    divisor = int(money.get("divisor") or 100)
+    payload = {
+        "quantity": max(1, int(offering.get("quantity") or listing.get("quantity") or 1)),
+        "title": title,
+        "description": description,
+        "price": (int(money.get("amount") or 0) / divisor),
+        "who_made": listing.get("who_made") or "i_did",
+        "when_made": listing.get("when_made") or "made_to_order",
+        "taxonomy_id": int(listing.get("taxonomy_id") or 0),
+        "is_supply": "true" if listing.get("is_supply") else "false",
+        "is_customizable": "true" if listing.get("is_customizable") else "false",
+        "should_auto_renew": "true" if listing.get("should_auto_renew", True) else "false",
+        "is_taxable": "true" if listing.get("is_taxable", True) else "false",
+        "type": listing.get("listing_type") or "physical",
+    }
+    readiness = offering.get("readiness_state_id") or listing.get("readiness_state_id")
+    if readiness:
+        payload["readiness_state_id"] = int(readiness)
+    scalar_fields = (
+        "shipping_profile_id", "return_policy_id", "shop_section_id",
+        "item_weight", "item_weight_unit", "item_length", "item_width", "item_height",
+        "item_dimensions_unit", "processing_min", "processing_max", "language",
+    )
+    for field in scalar_fields:
+        value = listing.get(field)
+        if value not in (None, "", 0, 0.0):
+            payload[field] = value
+    for field in ("tags", "materials", "style", "production_partner_ids"):
+        values = listing.get(field) or []
+        if values:
+            payload[field] = ",".join(str(value) for value in values)
+    if not payload["taxonomy_id"] or payload["price"] <= 0:
+        raise HTTPException(422, "Le template ne fournit pas la taxonomie ou le prix requis pour sa copie")
+    return payload
+
+
+def _personalization_copy_payload(personalization):
+    copied = []
+    for source in personalization.get("personalization_questions") or []:
+        question = {
+            field: source[field]
+            for field in (
+                "question_type", "question_text", "instructions", "required",
+                "max_allowed_characters", "max_allowed_files",
+            )
+            if source.get(field) is not None
+        }
+        if source.get("options"):
+            question["options"] = [
+                {"label": option.get("label")}
+                for option in source["options"] if option.get("label")
+            ]
+        copied.append(question)
+    return {"personalization_questions": copied}
+
+
+def _download_template_image(image):
+    url = image.get("url_fullxfull") or image.get("url_570xN")
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith("etsystatic.com"):
+        raise HTTPException(502, "Etsy n'a pas fourni une URL d'image de template sûre")
+    try:
+        response = ETSY_SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise HTTPException(502, f"Téléchargement d'une image du template impossible: {exc}") from exc
+    if not response.content or len(response.content) > 20 * 1024 * 1024:
+        raise HTTPException(502, "Une image du template est vide ou dépasse 20 Mo")
+    content_type = response.headers.get("Content-Type") or "image/jpeg"
+    return (f"template-{image.get('listing_image_id') or 'image'}.jpg", content_type, response.content)
+
+
+def _copy_listing_properties(shop_id, source_properties, inventory, target_listing_id):
+    variation_ids = {
+        int(prop.get("property_id") or 0)
+        for product in inventory.get("products") or []
+        for prop in product.get("property_values") or []
+    }
+    properties = source_properties.get("results") if isinstance(source_properties, dict) else source_properties
+    for prop in properties or []:
+        property_id = int(prop.get("property_id") or 0)
+        if not property_id or property_id in variation_ids:
+            continue
+        payload = {}
+        if prop.get("value_ids"):
+            payload["value_ids"] = ",".join(str(value) for value in prop["value_ids"])
+        if prop.get("values"):
+            payload["values"] = ",".join(str(value) for value in prop["values"])
+        if prop.get("scale_id"):
+            payload["scale_id"] = prop["scale_id"]
+        if not payload:
+            continue
+        response, data = etsy_request(
+            "PUT",
+            f"/shops/{shop_id}/listings/{target_listing_id}/properties/{property_id}",
+            data=payload,
+        )
+        require_etsy_success(response, data, f"Copie de l'attribut {property_id}")
+
+
+def _upload_listing_image(shop_id, listing_id, filename, content_type, blob):
+    response, data = etsy_request(
+        "POST", f"/shops/{shop_id}/listings/{listing_id}/images",
+        data={"rank": "1", "overwrite": "false"},
+        files={"image": (filename, blob, content_type)},
+    )
+    require_etsy_success(response, data, "Ajout d'une image")
+    image_id = int(data.get("listing_image_id") or 0)
+    if not image_id:
+        raise HTTPException(502, "Etsy n'a pas confirmé une image")
+    return image_id
+
+
+def _force_listing_image_order(shop_id, listing_id, desired_ids):
+    # Etsy documente la réassociation d'une image supprimée. On détache donc
+    # les images de la copie uniquement, puis on les réassocie en ordre inverse
+    # au rang 1 afin d'obtenir exactement l'ordre demandé.
+    for image_id in desired_ids:
+        response, data = etsy_request(
+            "DELETE", f"/shops/{shop_id}/listings/{listing_id}/images/{image_id}"
+        )
+        require_etsy_success(response, data, "Préparation de l'ordre des images")
+    ordered_ids = []
+    for image_id in reversed(desired_ids):
+        response, data = etsy_request(
+            "POST", f"/shops/{shop_id}/listings/{listing_id}/images",
+            data={"listing_image_id": image_id, "rank": "1", "overwrite": "false"},
+        )
+        require_etsy_success(response, data, "Réorganisation des images")
+        confirmed = int(data.get("listing_image_id") or 0)
+        if confirmed != image_id:
+            raise HTTPException(502, "Etsy n'a pas confirmé la réorganisation d'une image")
+        ordered_ids.insert(0, confirmed)
+    return ordered_ids
+
+
 def _validate_publish_inputs(title, description, quantity, sku_prefix, image_sha256s):
     title = str(title or "").strip()
     description = str(description or "").strip()
@@ -2070,6 +2222,12 @@ def _publish_context(listing_id, title, description, quantity, sku_prefix, image
     require_etsy_success(inventory_response, inventory, "Récupération de l'inventaire")
     if not inventory.get("products"):
         raise HTTPException(422, "L'inventaire du draft est vide")
+    personalization_response, personalization = etsy_request(
+        "GET", f"/listings/{listing_id}/personalization"
+    )
+    require_etsy_success(personalization_response, personalization, "Récupération des personnalisations")
+    properties_response, properties = etsy_request("GET", f"/listings/{listing_id}/properties")
+    require_etsy_success(properties_response, properties, "Récupération des attributs")
     backup_inventory, _ = _clean_inventory_payload(inventory, Decimal("0"))
     desired_inventory = _publish_inventory_payload(inventory, quantity, sku_prefix)
     context = {
@@ -2086,6 +2244,8 @@ def _publish_context(listing_id, title, description, quantity, sku_prefix, image
             ],
         },
         "inventory": backup_inventory,
+        "personalization": personalization,
+        "properties": properties,
         "requested": {
             "title": title,
             "description": description,
@@ -2101,6 +2261,8 @@ def _publish_context(listing_id, title, description, quantity, sku_prefix, image
         "backup_inventory": backup_inventory,
         "desired_inventory": desired_inventory,
         "existing_images": existing_images,
+        "personalization": personalization,
+        "properties": properties,
         "plan_sha256": _inventory_fingerprint(context),
         "title": title,
         "description": description,
@@ -2129,6 +2291,8 @@ def preview_listing_publish(listing_id, payload):
         # en ne l'envoyant jamais dans le PATCH, mais ne prétend pas le deviner.
         "featured": int(context["listing"].get("featured_rank") or 0) > 0,
         "state": "draft",
+        "workflow": "clone_template_then_publish_copy",
+        "template_preserved": True,
         "preserved": [
             "category", "variations", "prices", "custom_options", "tags",
             "attributes", "shipping", "processing", "existing_images",
@@ -2167,45 +2331,63 @@ def apply_listing_publish(
         raise HTTPException(409, "Le draft ou l'inventaire a changé depuis l'aperçu")
 
     shop_id = context["shop_id"]
-    old_title = context["listing"].get("title") or ""
-    old_description = context["listing"].get("description") or ""
-    uploaded_ids = []
-    mutated = False
+    template_images = sorted(
+        context["existing_images"], key=lambda item: int(item.get("rank") or 0)
+    )
+    template_image_blobs = [_download_template_image(image) for image in template_images]
+    clone_listing_id = None
     try:
         response, data = etsy_request(
-            "PATCH", f"/shops/{shop_id}/listings/{listing_id}",
-            data={"title": context["title"], "description": context["description"]},
+            "POST", f"/shops/{shop_id}/listings",
+            data=_draft_clone_payload(
+                context["listing"], context["inventory"],
+                context["title"], context["description"],
+            ),
         )
-        require_etsy_success(response, data, "Mise à jour du SEO")
-        mutated = True
+        require_etsy_success(response, data, "Création de la copie du template")
+        clone_listing_id = int(data.get("listing_id") or 0)
+        if not clone_listing_id or clone_listing_id == int(listing_id):
+            raise HTTPException(502, "Etsy n'a pas confirmé un nouvel identifiant pour la copie")
+
         response, data = etsy_request(
-            "PUT", f"/listings/{listing_id}/inventory",
+            "PUT", f"/listings/{clone_listing_id}/inventory",
             params={"max_variations_supported": "3"},
             json_data=context["desired_inventory"],
         )
-        require_etsy_success(response, data, "Mise à jour des quantités et SKU")
-        for filename, content_type, blob in reversed(image_blobs):
+        require_etsy_success(response, data, "Copie des variantes, prix, quantités et SKU")
+        _copy_listing_properties(
+            shop_id, context["properties"], context["inventory"], clone_listing_id
+        )
+        personalization_payload = _personalization_copy_payload(context["personalization"])
+        if personalization_payload["personalization_questions"]:
             response, data = etsy_request(
-                "POST", f"/shops/{shop_id}/listings/{listing_id}/images",
-                data={"rank": "1", "overwrite": "false"},
-                files={"image": (filename, blob, content_type)},
+                "POST", f"/shops/{shop_id}/listings/{clone_listing_id}/personalization",
+                params={"supports_multiple_personalization_questions": "true"},
+                json_data=personalization_payload,
             )
-            require_etsy_success(response, data, "Ajout d'une image")
-            image_id = int(data.get("listing_image_id") or 0)
-            if not image_id:
-                raise HTTPException(502, "Etsy n'a pas confirmé une image")
-            uploaded_ids.insert(0, image_id)
+            require_etsy_success(response, data, "Copie des options personnalisées")
+
+        copied_template_ids = [
+            _upload_listing_image(shop_id, clone_listing_id, filename, content_type, blob)
+            for filename, content_type, blob in template_image_blobs
+        ]
+        new_image_ids = [
+            _upload_listing_image(shop_id, clone_listing_id, filename, content_type, blob)
+            for filename, content_type, blob in image_blobs
+        ]
+        desired_image_ids = new_image_ids + copied_template_ids
+        _force_listing_image_order(shop_id, clone_listing_id, desired_image_ids)
 
         mismatches = []
         for attempt in range(4):
             if attempt:
                 time.sleep(attempt)
             verify_response, verified = etsy_request(
-                "GET", f"/listings/{listing_id}", params={"includes": "Images"}
+                "GET", f"/listings/{clone_listing_id}", params={"includes": "Images"}
             )
             require_etsy_success(verify_response, verified, "Vérification du draft")
             mismatches = _publish_draft_mismatches(
-                verified, context["title"], context["description"], uploaded_ids
+                verified, context["title"], context["description"], desired_image_ids
             )
             if not mismatches:
                 break
@@ -2217,36 +2399,23 @@ def apply_listing_publish(
             )
 
         response, data = etsy_request(
-            "PATCH", f"/shops/{shop_id}/listings/{listing_id}", data={"state": "active"}
+            "PATCH", f"/shops/{shop_id}/listings/{clone_listing_id}", data={"state": "active"}
         )
         require_etsy_success(response, data, "Publication du listing")
         return {
             "success": True,
             "applied": True,
             "verified": True,
-            "listing_id": int(listing_id),
-            "listing_url": data.get("url") or f"https://www.etsy.com/listing/{listing_id}",
-            "uploaded_image_ids": uploaded_ids,
+            "listing_id": clone_listing_id,
+            "template_listing_id": int(listing_id),
+            "template_preserved": True,
+            "listing_url": data.get("url") or f"https://www.etsy.com/listing/{clone_listing_id}",
+            "uploaded_image_ids": new_image_ids,
         }
     except Exception:
-        if mutated:
-            for image_id in uploaded_ids:
-                try:
-                    etsy_request(
-                        "DELETE", f"/shops/{shop_id}/listings/{listing_id}/images/{image_id}"
-                    )
-                except Exception:
-                    pass
+        if clone_listing_id:
             try:
-                etsy_request(
-                    "PUT", f"/listings/{listing_id}/inventory",
-                    params={"max_variations_supported": "3"},
-                    json_data=context["backup_inventory"],
-                )
-                etsy_request(
-                    "PATCH", f"/shops/{shop_id}/listings/{listing_id}",
-                    data={"title": old_title, "description": old_description},
-                )
+                etsy_request("DELETE", f"/listings/{clone_listing_id}")
             except Exception:
                 pass
         raise
