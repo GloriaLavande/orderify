@@ -288,6 +288,25 @@ class BackendContractTests(unittest.TestCase):
         self.assertNotIn("question_id", question)
         self.assertEqual(question["options"], [{"label": "Font A"}])
 
+    def test_publish_context_reads_properties_from_shop_listing_endpoint(self):
+        listing = {
+            "listing_id": 42, "shop_id": 7, "state": "draft", "images": [],
+            "title": "Template", "description": "Template description",
+        }
+        inventory = delivered_inventory("No strap")
+        personalization = {"personalization_questions": []}
+        properties = {"results": []}
+        ok = Mock(status_code=200)
+        with patch.object(backend, "get_shop_id_for_user", return_value=7), \
+             patch.object(backend, "etsy_request", side_effect=[
+                 (ok, listing), (ok, inventory), (ok, personalization), (ok, properties),
+             ]) as request:
+            backend._publish_context(
+                42, "New title", "New description", 73, "BLU", ["a" * 64]
+            )
+        paths = [call.args[1] for call in request.call_args_list]
+        self.assertEqual(paths[-1], "/shops/7/listings/42/properties")
+
     def test_publish_applies_changes_to_clone_and_preserves_template(self):
         inventory = delivered_inventory("No strap", cents=4023)
         inventory["products"][0]["offerings"][0]["readiness_state_id"] = 9

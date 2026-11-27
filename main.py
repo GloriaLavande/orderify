@@ -23,7 +23,7 @@ from urllib3.util.retry import Retry
 
 
 APP_NAME = "Orderify API"
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.9.1"
 STARTED_AT = time.time()
 
 CLIENT_ID = os.getenv("ETSY_API_KEY")
@@ -2226,7 +2226,9 @@ def _publish_context(listing_id, title, description, quantity, sku_prefix, image
         "GET", f"/listings/{listing_id}/personalization"
     )
     require_etsy_success(personalization_response, personalization, "Récupération des personnalisations")
-    properties_response, properties = etsy_request("GET", f"/listings/{listing_id}/properties")
+    properties_response, properties = etsy_request(
+        "GET", f"/shops/{shop_id}/listings/{listing_id}/properties"
+    )
     require_etsy_success(properties_response, properties, "Récupération des attributs")
     backup_inventory, _ = _clean_inventory_payload(inventory, Decimal("0"))
     desired_inventory = _publish_inventory_payload(inventory, quantity, sku_prefix)
